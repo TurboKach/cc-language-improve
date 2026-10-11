@@ -1,0 +1,16 @@
+{
+  "name": "cc-language-improve",
+  "owner": {
+    "name": "TurboKach"
+  },
+  "plugins": [
+    {
+      "name": "language-improve",
+      "source": "./",
+      "description": "Checks your prompt draft's English with Haiku after a pause and shows the corrected sentence in the band above the prompt."
+    }
+  ],
+  "metadata": {
+    "description": "Marketplace that lists this repo as its one plugin"
+  }
+}

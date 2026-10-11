@@ -1,0 +1,9 @@
+{
+  "name": "language-improve",
+  "version": "0.1.0",
+  "description": "Checks your prompt draft's English with Haiku after a pause and shows the corrected sentence in the band above the prompt.",
+  "author": {
+    "name": "TurboKach"
+  },
+  "types": "./types/index.d.ts"
+}
