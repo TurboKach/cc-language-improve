@@ -1,10 +1,11 @@
 // Change detection, debounce, cache, abort, stale drop and `sent` mode for the
 // language-improve mod. No `$`, no timers, no Node: every effect comes in
 // through `deps`.
-import { RULES, containsWordRun, normalizeWhitespace, parseReply, prepareDraft } from './lib.js'
+import { containsWordRun, normalizeWhitespace, parseErrors, prepareDraft, systemPrompt } from './lib.js'
 
 const DEBOUNCE_MS = 1500
-const TIMEOUT_MS = 10000
+const TIMEOUT_MS = 20000
+const MAX_TOKENS = 2048
 
 /**
  * deps:
@@ -13,17 +14,20 @@ const TIMEOUT_MS = 10000
  *   complete(request, { signal }) -> Promise<result union>   the model call
  *   setView(view | null)                                      writes the shown view
  *
- * Returns `{ poke(text?), submit(text), stop() }`; `poke` and `submit` return
- * promises that settle when the work they started is done (callers need not
- * await them).
+ * Returns `{ poke(text?), submit(text), setMuted(slugs), stop() }`; `poke` and
+ * `submit` return promises that settle when the work they started is done
+ * (callers need not await them). `setMuted` takes the muted kind slugs and
+ * applies at once: the model is told to leave them out, and a cached result
+ * made with another muted list is not reused.
  */
 export const createChecker = ({ read, after, complete, setView }) => {
   let lastSeen = ''
   let submitted = new Set() // texts that are not a change after a submit
   let requestId = 0 // bumped on every change and submit; guards timer callbacks
   let timer = null
-  let active = null // the one live model call: { draft, sentText, mode, controller, done }
-  let cache = null // one entry: { draft, result }
+  let active = null // the one live model call: { draft, sentText, mode, muted, key, controller, done }
+  let cache = null // one entry: { key, result }; key is the draft plus the muted list
+  let muted = [] // muted kind slugs, sorted
   let view = null // the view last written through setView
   let stopped = false // set by stop(): no effect leaves this checker afterwards
 
@@ -45,6 +49,8 @@ export const createChecker = ({ read, after, complete, setView }) => {
     active = null
   }
 
+  const cacheKey = (draft, slugs) => `${draft}\n${slugs.join(',')}`
+
   const apply = (result, source) => {
     if (result === 'ok') show({ kind: 'ok', source })
     else if (result !== 'skip' && result !== null) show({ kind: 'fix', source, ...result })
@@ -54,7 +60,7 @@ export const createChecker = ({ read, after, complete, setView }) => {
     let reply
     try {
       reply = await complete(
-        { model: 'haiku', system: RULES, prompt: call.sentText, timeoutMs: TIMEOUT_MS },
+        { model: 'haiku', system: systemPrompt(call.muted), prompt: call.sentText, timeoutMs: TIMEOUT_MS, maxTokens: MAX_TOKENS },
         { signal: call.controller.signal },
       )
     } catch {
@@ -65,7 +71,7 @@ export const createChecker = ({ read, after, complete, setView }) => {
       active = null
       return
     }
-    const result = parseReply(reply.text, call.sentText)
+    const result = parseErrors(reply.text, call.sentText)
     const { text: current } = await read()
     if (active !== call) return
     // A draft answer belongs to the draft it was asked about; a sent answer
@@ -76,7 +82,7 @@ export const createChecker = ({ read, after, complete, setView }) => {
         : current === call.draft
     active = null
     if (!fresh) return
-    if (result !== null) cache = { draft: call.draft, result }
+    if (result !== null) cache = { key: call.key, result }
     apply(result, call.mode)
   }
 
@@ -84,12 +90,13 @@ export const createChecker = ({ read, after, complete, setView }) => {
     if (stopped) return Promise.resolve()
     const sentText = prepareDraft(draft)
     if (sentText === null) return Promise.resolve()
-    if (cache !== null && cache.draft === draft) {
+    const key = cacheKey(draft, muted)
+    if (cache !== null && cache.key === key) {
       apply(cache.result, mode)
       return Promise.resolve()
     }
     abortActive()
-    const call = { draft, sentText, mode, controller: new AbortController(), done: null }
+    const call = { draft, sentText, mode, muted, key, controller: new AbortController(), done: null }
     active = call
     call.done = run(call)
     return call.done
@@ -124,15 +131,15 @@ export const createChecker = ({ read, after, complete, setView }) => {
     submitted = new Set()
     abortActive()
     if (view !== null) {
-      // Kept only while its original is in the text that would be sent now;
-      // a draft that is now skipped clears it.
+      // Each error is kept only while its original is in the text that would
+      // be sent now; a draft that is now skipped clears the view.
       const sentNow = prepareDraft(text)
-      const keep =
-        view.source === 'draft' &&
-        view.kind === 'fix' &&
-        sentNow !== null &&
-        containsWordRun(normalizeWhitespace(sentNow), view.original)
-      if (!keep) clearView()
+      const kept =
+        view.source === 'draft' && view.kind === 'fix' && sentNow !== null
+          ? view.errors.filter((error) => containsWordRun(normalizeWhitespace(sentNow), error.original))
+          : []
+      if (kept.length === 0) clearView()
+      else if (kept.length < view.errors.length) show({ ...view, errors: kept })
     }
     startTimer()
   }
@@ -165,12 +172,16 @@ export const createChecker = ({ read, after, complete, setView }) => {
         abortActive()
       }
 
-      const hit = [text, pre].map((draft) => (cache !== null && cache.draft === draft ? cache : null)).find(Boolean)
+      const hit = [text, pre].map((draft) => (cache !== null && cache.key === cacheKey(draft, muted) ? cache : null)).find(Boolean)
       if (hit) {
         apply(hit.result, 'sent')
         return kept ? kept.done : Promise.resolve()
       }
       return kept ? kept.done : check(text, 'sent')
+    },
+
+    setMuted: (slugs) => {
+      muted = [...slugs].sort()
     },
 
     stop: () => {

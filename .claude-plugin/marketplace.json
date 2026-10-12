@@ -7,7 +7,7 @@
     {
       "name": "language-improve",
       "source": "./",
-      "description": "Checks your prompt draft's English with Haiku after a pause and shows the corrected sentence in the band above the prompt."
+      "description": "Checks your prompt draft's English with Haiku after a pause and lists up to 8 errors with their corrections in the band above the prompt. Mute the kinds of error you do not want to see."
     }
   ],
   "metadata": {

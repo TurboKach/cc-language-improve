@@ -8,16 +8,36 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 // code review and in the real client.
 
 const DRAFT = 'I want that you checks my text.'
-const FIX = JSON.stringify({
-  count: 1,
-  last: { original: DRAFT, corrected: 'I want you to check my text.', why: 'want + object · verb form' },
-})
+const ERROR = {
+  original: DRAFT,
+  corrected: 'I want you to check my text.',
+  changes: [
+    { kind: 'word-choice', why: 'want + object' },
+    { kind: 'verb-form', why: 'verb form' },
+  ],
+}
+const FIX = JSON.stringify({ errors: [ERROR] })
+const MORE_DRAFT = `${DRAFT} She go home. He have a dog.`
 const MORE = JSON.stringify({
-  count: 3,
-  last: { original: DRAFT, corrected: 'I want you to check my text.', why: 'want + object · verb form' },
+  errors: [
+    ERROR,
+    { original: 'She go home.', corrected: 'She goes home.', changes: [{ kind: 'agreement', why: 'agreement' }] },
+    { original: 'He have a dog.', corrected: 'He has a dog.', changes: [{ kind: 'agreement', why: 'agreement' }] },
+  ],
+})
+const MANY_DRAFT = `${DRAFT} She go home. I dont know it. He have a dog.`
+const MANY = JSON.stringify({
+  errors: [
+    ERROR,
+    { original: 'She go home.', corrected: 'She goes home.', changes: [{ kind: 'agreement', why: 'agreement' }] },
+    { original: 'I dont know it.', corrected: "I don't know it.", changes: [{ kind: 'apostrophe', why: 'missing apostrophe' }] },
+    { original: 'He have a dog.', corrected: 'He has a dog.', changes: [{ kind: 'agreement', why: 'agreement' }] },
+  ],
 })
 const OK = JSON.stringify({ ok: true })
 
+// Wide enough for the whole action row.
+const WIDE = 200
 const mountTarget = (props: Record<string, unknown> = {}) =>
   ({
     plugin: 'language-improve',
@@ -37,9 +57,36 @@ const mountTarget = (props: Record<string, unknown> = {}) =>
   }) as const
 
 // Registers every stub before the first `$` call, then starts the session.
-const boot = async ($: any, on: any, { isInteractive = true, reply = FIX } = {}) => {
+const boot = async ($: any, on: any, { isInteractive = true, reply = FIX, stored = [] as unknown } = {}) => {
   const clock = mock.clock(on)
-  const world = { draft: '', reply, requests: [] as any[], submits: [] as any[] }
+  // The plugin's store, in memory; a test edits `world.store` to play "another session".
+  const world = {
+    draft: '',
+    reply,
+    requests: [] as any[],
+    submits: [] as any[],
+    toasts: [] as string[],
+    commands: [] as any[],
+    opens: [] as any[],
+    store: new Map<string, unknown>(stored === undefined ? [] : [['muted', stored]]),
+  }
+  on('store.get', (_$: any, e: any) => ({ value: world.store.get(e.key) }))
+  on('store.set', (_$: any, e: any) => {
+    world.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('ui.toast', (_$: any, e: any) => {
+    world.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('command.register', (_$: any, e: any) => {
+    world.commands.push(e)
+    return { value: { command: e.name } }
+  })
+  on('ui.open', (_$: any, e: any) => {
+    world.opens.push(e)
+    return { value: { isPlaced: true } }
+  })
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('prompt.read', () => ({ value: { text: world.draft, cursor: world.draft.length } }))
   on('model.complete', (_$: any, e: any) => {
@@ -97,12 +144,24 @@ describe('AbovePrompt band', () => {
     expect(segments.some((s: any) => s.text.includes('more'))).toBe(false)
   })
 
-  test('shows "+N more" when more sentences have errors', async ($, on) => {
+  test('shows "+N more" in the compact form at maxRows: 2', async ($, on) => {
     const { clock, world } = await boot($, on, { reply: MORE })
-    await typeAndWait(clock, world, DRAFT)
-    const ui = await $.ui.mount(mountTarget())
+    await typeAndWait(clock, world, MORE_DRAFT)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 2 }))
     const segments = await segmentsOf(ui)
     expect(segments.some((s: any) => s.text === '  +2 more' && s.props.dimColor === true)).toBe(true)
+  })
+
+  test('at maxRows: 3 one error shows with the page text and no "+N more"', async ($, on) => {
+    const { clock, world } = await boot($, on, { reply: MORE })
+    await typeAndWait(clock, world, MORE_DRAFT)
+    const ui = await $.ui.mount(mountTarget())
+    expect(await ui.find({ type: 'Text', text: '‹ 1/3 ›' })).toBeDefined()
+    expect((await rowsOf(ui)).map((r: any) => r.text).filter((t: string) => t !== 'OTHER')).toEqual([
+      '✎ English · I want you to check my text.',
+      '  want + object · verb form',
+    ])
+    expect((await segmentsOf(ui)).some((s: any) => s.text.includes('more'))).toBe(false)
   })
 
   test('shows "✓ no errors" for an ok reply', async ($, on) => {
@@ -136,11 +195,13 @@ describe('AbovePrompt band', () => {
   })
 
   test('never emits more rows than maxRows', async ($, on) => {
-    const { clock, world } = await boot($, on)
-    await typeAndWait(clock, world, DRAFT)
-    for (const maxRows of [1, 2, 3]) {
+    const { clock, world } = await boot($, on, { reply: MANY })
+    await typeAndWait(clock, world, MANY_DRAFT)
+    for (const maxRows of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
       const ui = await $.ui.mount(mountTarget({ maxRows }))
-      const rows = (await rowsOf(ui)).filter((r: any) => r.text !== 'OTHER').length
+      // Our rows: the text rows, and the action row (the one row-direction Box).
+      const actionRows = (await ui.findAll({ type: 'Box' })).filter((b: any) => b.props.flexDirection === 'row').length
+      const rows = (await rowsOf(ui)).filter((r: any) => r.text !== 'OTHER').length + actionRows
       // Our Box is the one that carries marginTop.
       const gap = (await ui.findAll({ type: 'Box' })).some((b: any) => b.props.marginTop === 1) ? 1 : 0
       expect(rows + gap).toBeLessThanOrEqual(maxRows)
@@ -162,6 +223,240 @@ describe('AbovePrompt band', () => {
     const ui = await $.ui.mount(mountTarget({ hasSurvey: true }))
     expect(await ui.find({ type: 'Text', text: 'OTHER' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '✎' })).toBeUndefined()
+  })
+})
+
+describe('stacked band, paging and mute', () => {
+  const bandTexts = async (ui: any) =>
+    (await rowsOf(ui)).map((r: any) => r.text).filter((t: string) => t !== 'OTHER')
+  const manyBand = async ($: any, on: any, options = {}) => {
+    const booted = await boot($, on, { reply: MANY, ...options })
+    await typeAndWait(booted.clock, booted.world, MANY_DRAFT)
+    return booted
+  }
+
+  test('4 errors at maxRows 10: 3 errors, the action row and the page text', async ($, on) => {
+    await manyBand($, on)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    expect(await bandTexts(ui)).toEqual([
+      '✎ English · I want you to check my text.',
+      '  want + object · verb form',
+      '✎ She goes home.',
+      '  agreement',
+      "✎ I don't know it.",
+      '  missing apostrophe',
+    ])
+    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'ctrl+x tab' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'OTHER' })).toBeDefined()
+    const hotkeys = async (key: string) => (await ui.find({ key }))?.props.hotkey
+    expect(await hotkeys('page:next')).toBe('n')
+    expect(await hotkeys('page:back')).toBe('p')
+    expect(await hotkeys('mute:word-choice')).toBe('a')
+    expect(await hotkeys('mute:verb-form')).toBe('s')
+    expect(await hotkeys('mute:agreement')).toBe('d')
+    expect(await hotkeys('mute:apostrophe')).toBe('f')
+  })
+
+  test('the Buttons are plain and use letter hotkeys only', async ($, on) => {
+    await manyBand($, on)
+    for (const maxRows of [3, 5, 7, 10]) {
+      const ui = await $.ui.mount(mountTarget({ maxRows }))
+      const buttons = await ui.findAll({ type: 'Button' })
+      expect(buttons.length).toBeGreaterThan(0)
+      for (const b of buttons) {
+        expect(b.props.plain).toBe(true)
+        expect(b.props.hotkey).toMatch(/^[a-z]$/)
+      }
+      await ui.unmount()
+    }
+  })
+
+  test('page:next goes to page 2, wraps to page 1; page:back wraps and returns', async ($, on) => {
+    await manyBand($, on)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    await ui.press({ key: 'page:next' })
+    expect(await bandTexts(ui)).toEqual(['✎ English · He has a dog.', '  agreement'])
+    expect(await ui.find({ type: 'Text', text: '‹ 2/2 ›' })).toBeDefined()
+    await ui.press({ key: 'page:next' })
+    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeDefined()
+    expect((await bandTexts(ui))[0]).toBe('✎ English · I want you to check my text.')
+    await ui.press({ key: 'page:back' })
+    expect(await ui.find({ type: 'Text', text: '‹ 2/2 ›' })).toBeDefined()
+    await ui.press({ key: 'page:back' })
+    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeDefined()
+  })
+
+  test('a new view starts on page 1', async ($, on) => {
+    const { clock, world } = await manyBand($, on)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    await ui.press({ key: 'page:next' })
+    expect(await ui.find({ type: 'Text', text: '‹ 2/2 ›' })).toBeDefined()
+    world.reply = MANY
+    await typeAndWait(clock, world, `${MANY_DRAFT} Fine.`)
+    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeDefined()
+  })
+
+  test('muting a kind redraws without it, stores it, toasts, and tells the model', async ($, on) => {
+    const { clock, world } = await manyBand($, on)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    await ui.press({ key: 'mute:apostrophe' })
+    expect(await bandTexts(ui)).toEqual([
+      '✎ English · I want you to check my text.',
+      '  want + object · verb form',
+      '✎ She goes home.',
+      '  agreement',
+      '✎ He has a dog.',
+      '  agreement',
+    ])
+    expect(await ui.find({ key: 'mute:apostrophe' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeUndefined()
+    expect(world.store.get('muted')).toEqual(['apostrophe'])
+    expect(world.toasts).toEqual(['Muted apostrophes · /language-improve to unmute'])
+
+    expect(world.requests).toHaveLength(1)
+    expect(world.requests[0].system).not.toContain('Do not report')
+    await typeAndWait(clock, world, `${MANY_DRAFT} Fine.`)
+    expect(world.requests).toHaveLength(2)
+    expect(world.requests[1].system).toContain('Do not report or fix these kinds: apostrophes.')
+  })
+
+  test('a mute merges with what another session stored', async ($, on) => {
+    const { clock, world } = await manyBand($, on)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    world.store.set('muted', ['comma']) // another session mutes commas
+    await ui.press({ key: 'mute:apostrophe' })
+    expect(world.store.get('muted')).toEqual(['comma', 'apostrophe'])
+    await typeAndWait(clock, world, `${MANY_DRAFT} Fine.`)
+    expect(world.requests.at(-1).system).toContain('Do not report or fix these kinds: apostrophes, commas.')
+  })
+
+  test('muting every visible kind reads "no errors"', async ($, on) => {
+    const { clock, world } = await boot($, on)
+    await typeAndWait(clock, world, DRAFT)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    await ui.press({ key: 'mute:word-choice' })
+    expect(await bandTexts(ui)).toEqual(['✎ English · I want you to check my text.', '  verb form'])
+    await ui.press({ key: 'mute:verb-form' })
+    expect(await bandTexts(ui)).toEqual(['✓ English · no errors'])
+    expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+    expect(world.toasts).toHaveLength(2)
+  })
+
+  test('session.start loads the stored list, drops unknown slugs and tells the checker', async ($, on) => {
+    const { clock, world } = await boot($, on, { stored: ['verb-form', 'nope', 7, 'word-choice', 'verb-form'] })
+    await typeAndWait(clock, world, DRAFT)
+    expect(world.requests[0].system).toContain('Do not report or fix these kinds: verb forms, word choice.')
+    expect(world.requests[0].system).not.toContain('nope')
+    const ui = await $.ui.mount(mountTarget())
+    expect((await rowsOf(ui)).filter((r: any) => r.text === '✓ English · no errors')).toHaveLength(1)
+  })
+
+  test('a stored value that is not a list loads as nothing muted', async ($, on) => {
+    const { clock, world } = await boot($, on, { stored: 'apostrophe' })
+    await typeAndWait(clock, world, DRAFT)
+    expect(world.requests[0].system).not.toContain('Do not report')
+  })
+
+  test('a narrow band drops the hint first, then mute buttons from the end', async ($, on) => {
+    await manyBand($, on)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: 60 }))
+    expect(await ui.find({ type: 'Text', text: 'ctrl+x tab' })).toBeUndefined()
+    expect(await ui.find({ key: 'mute:word-choice' })).toBeDefined()
+    expect(await ui.find({ key: 'mute:apostrophe' })).toBeUndefined()
+    expect(await ui.find({ key: 'page:next' })).toBeDefined()
+  })
+
+  test('maxRows 2 and 1 keep the compact forms with no Buttons', async ($, on) => {
+    await manyBand($, on)
+    for (const maxRows of [2, 1]) {
+      const ui = await $.ui.mount(mountTarget({ maxRows }))
+      expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+      expect((await bandTexts(ui)).length).toBe(maxRows)
+      await ui.unmount()
+    }
+  })
+})
+
+describe('/language-improve pane', () => {
+  const paneTarget = () =>
+    ({
+      plugin: 'language-improve',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'muted',
+      viewport: { columns: 80, rows: 24 },
+      props: { title: 'Muted English errors', isFocused: true, bodyColumns: 70, placement: 'inline' },
+    }) as any
+
+  test('session.start registers the command as immediate', async ($, on) => {
+    const { world } = await boot($, on)
+    expect(world.commands).toHaveLength(1)
+    expect(world.commands[0]).toMatchObject({ name: 'language-improve', immediate: true })
+    expect(typeof world.commands[0].description).toBe('string')
+  })
+
+  test('running it opens the pane with focus, Escape-close and rows sized to the heading and list', async ($, on) => {
+    const { world } = await boot($, on, { stored: ['apostrophe', 'comma'] })
+    const result = await $.command.run({ command: 'language-improve' })
+    expect(result.text).toBeUndefined()
+    expect(world.opens).toHaveLength(1)
+    expect(world.opens[0]).toMatchObject({ id: 'muted', focus: true, closeOnEscape: true, rows: 3 })
+    expect(typeof world.opens[0].title).toBe('string')
+  })
+
+  test('with nothing muted the pane opens a heading and one line tall', async ($, on) => {
+    const { world } = await boot($, on)
+    await $.command.run({ command: 'language-improve' })
+    expect(world.opens[0].rows).toBe(2)
+  })
+
+  test('the pane draws its own heading, as a single pane shows no title', async ($, on) => {
+    await boot($, on, { stored: ['apostrophe'] })
+    expect(await (await $.ui.mount(paneTarget())).find({ type: 'Text', text: 'Muted English errors' })).toBeDefined()
+  })
+
+  test('the empty pane draws the heading too', async ($, on) => {
+    await boot($, on)
+    expect(await (await $.ui.mount(paneTarget())).find({ type: 'Text', text: 'Muted English errors' })).toBeDefined()
+  })
+
+  test('two muted kinds show two unmute Buttons with letter hotkeys', async ($, on) => {
+    await boot($, on, { stored: ['apostrophe', 'comma'] })
+    const ui = await $.ui.mount(paneTarget())
+    const buttons = await ui.findAll({ type: 'Button' })
+    expect(buttons.map((b: any) => [b.props.key, b.props.hotkey, b.props.plain, b.props.label])).toEqual([
+      ['unmute:apostrophe', 'a', true, 'unmute apostrophes'],
+      ['unmute:comma', 's', true, 'unmute commas'],
+    ])
+  })
+
+  test('a press unmutes: state, store and the checker', async ($, on) => {
+    const { clock, world } = await boot($, on, { stored: ['apostrophe', 'comma'] })
+    const ui = await $.ui.mount(paneTarget())
+    world.store.set('muted', ['apostrophe', 'comma', 'spelling']) // another session muted spelling
+    await ui.press({ key: 'unmute:apostrophe' })
+    expect(world.store.get('muted')).toEqual(['comma', 'spelling'])
+    expect(await ui.find({ key: 'unmute:apostrophe' })).toBeUndefined()
+    expect(await ui.find({ key: 'unmute:comma' })).toBeDefined()
+    await typeAndWait(clock, world, DRAFT)
+    expect(world.requests.at(-1).system).toContain('Do not report or fix these kinds: commas, spelling.')
+  })
+
+  test('unmuting the last kind shows the empty line', async ($, on) => {
+    const { world } = await boot($, on, { stored: ['apostrophe'] })
+    const ui = await $.ui.mount(paneTarget())
+    await ui.press({ key: 'unmute:apostrophe' })
+    expect(world.store.get('muted')).toEqual([])
+    expect(await ui.find({ type: 'Text', text: 'Nothing is muted. Focus the band (ctrl+x tab) and press a mute key.' })).toBeDefined()
+    expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+  })
+
+  test('with nothing muted the pane shows the empty line', async ($, on) => {
+    await boot($, on)
+    const ui = await $.ui.mount(paneTarget())
+    expect(await ui.find({ type: 'Text', text: 'Nothing is muted. Focus the band (ctrl+x tab) and press a mute key.' })).toBeDefined()
+    expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
   })
 })
 

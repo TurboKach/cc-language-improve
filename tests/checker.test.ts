@@ -4,9 +4,11 @@ import { createChecker } from '../hooks/checker.js'
 const A = 'I want that you checks my text.'
 const B = 'She go to school every day.'
 const ORIGINAL_A = 'I want that you checks my text.'
+const CHANGE = { kind: 'verb-form', why: 'verb form' }
+const errorOf = (original: string, corrected: string, changes = [CHANGE]) => ({ original, corrected, changes })
 const fixReply = (original = ORIGINAL_A, corrected = 'I want you to check my text.') =>
-  JSON.stringify({ count: 1, last: { original, corrected, why: 'verb form' } })
-const FIX_A = { original: ORIGINAL_A, corrected: 'I want you to check my text.', why: 'verb form', more: 0 }
+  JSON.stringify({ errors: [errorOf(original, corrected)] })
+const FIX_A = { errors: [errorOf(ORIGINAL_A, 'I want you to check my text.')] }
 
 const flush = async () => {
   for (let i = 0; i < 20; i++) await Promise.resolve()
@@ -69,8 +71,9 @@ describe('debounce and change detection', () => {
     expect(s.calls).toHaveLength(1)
     expect(s.calls[0].request.model).toBe('haiku')
     expect(s.calls[0].request.prompt).toBe(A)
-    expect(s.calls[0].request.timeoutMs).toBe(10000)
+    expect(s.calls[0].request.timeoutMs).toBe(20000)
     expect(typeof s.calls[0].request.system).toBe('string')
+    expect(s.calls[0].request.maxTokens).toBe(2048)
     expect(s.calls[0].signal.aborted).toBe(false)
     s.answer(0, fixReply())
     await p
@@ -184,7 +187,7 @@ describe('in-flight calls and stale answers', () => {
     expect(s.calls).toHaveLength(2)
     s.answer(1, fixReply('She go to school every day.', 'She goes to school every day.'))
     await p2
-    expect(s.last().corrected).toBe('She goes to school every day.')
+    expect(s.last().errors[0].corrected).toBe('She goes to school every day.')
   })
 })
 
@@ -229,7 +232,7 @@ describe('skip rules and failures', () => {
   test('a malformed reply shows nothing and the next change is checked', async () => {
     const s = setup()
     const { p: p } = await s.startDraftCall(A)
-    s.answer(0, '{"count":1,"last":{"original":"I want')
+    s.answer(0, '{"errors":[{"original":"I want')
     await p
     expect(s.views).toHaveLength(0)
     const { p: p2 } = await s.startDraftCall(B)
@@ -289,6 +292,25 @@ describe('view clear rules', () => {
     s.answer(0, fixReply('he cat', 'the cat'))
     await p
     expect(s.views).toHaveLength(0) // "he cat" is not a whole-word run of the sent text
+  })
+
+  test('with two errors, an edit that removes one writes a view with the other; keeping both writes nothing', async () => {
+    const s = setup()
+    const draft = `${A} ${B}`
+    const { p } = await s.startDraftCall(draft)
+    s.answer(
+      0,
+      JSON.stringify({ errors: [errorOf(A, 'I want you to check my text.'), errorOf(B, 'She goes to school every day.')] }),
+    )
+    await p
+    expect(s.views).toHaveLength(1)
+    await s.checker.poke(`${draft} Thanks`) // both originals are still there
+    expect(s.views).toHaveLength(1)
+    await s.checker.poke(`I want that you check my text. ${B} Thanks`) // the first original is gone
+    expect(s.views).toHaveLength(2)
+    expect(s.last()).toEqual({ kind: 'fix', source: 'draft', errors: [errorOf(B, 'She goes to school every day.')] })
+    await s.checker.poke('Something else entirely here') // none left
+    expect(s.last()).toBeNull()
   })
 
   test('an ok view is cleared on any change', async () => {
@@ -535,13 +557,104 @@ describe('submit clears the view for a new prompt', () => {
     s.answer(0, fixReply())
     await q
     await s.checker.poke('') // the box reads empty; the sent view stays
-    expect(s.last()).toMatchObject({ source: 'sent', original: ORIGINAL_A })
+    expect(s.last()).toMatchObject({ source: 'sent', errors: [{ original: ORIGINAL_A }] })
     const r = s.checker.submit(B)
     expect(s.last()).toBeNull()
     expect(s.calls).toHaveLength(2)
     s.answer(1, fixReply(B, 'She goes to school every day.'))
     await r
-    expect(s.last()).toMatchObject({ kind: 'fix', source: 'sent', original: B })
+    expect(s.last()).toMatchObject({ kind: 'fix', source: 'sent', errors: [{ original: B }] })
+  })
+})
+
+describe('muted kinds', () => {
+  const answerA = async (s: any, i = 0) => {
+    s.answer(i, fixReply())
+    await flush()
+  }
+
+  test('the request carries the muted line and maxTokens after setMuted', async () => {
+    const s = setup()
+    expect(s.checker.setMuted(['apostrophe'])).toBeUndefined()
+    const { p } = await s.startDraftCall(A)
+    expect(s.calls[0].request.system).toContain('Do not report or fix these kinds: apostrophes.')
+    expect(s.calls[0].request.maxTokens).toBe(2048)
+    await answerA(s)
+    await p
+    const t = setup()
+    const { p: q } = await t.startDraftCall(A)
+    expect(t.calls[0].request.system).not.toContain('Do not report')
+    await answerA(t)
+    await q
+  })
+
+  test('the same draft with the same muted list is a cache hit, in any slug order', async () => {
+    const s = setup()
+    s.checker.setMuted(['comma', 'apostrophe'])
+    const { p } = await s.startDraftCall(A)
+    await answerA(s)
+    await p
+    await s.checker.poke(B)
+    s.checker.setMuted(['apostrophe', 'comma'])
+    s.readText = A
+    await s.checker.poke(A)
+    await s.advance(1500)
+    expect(s.calls).toHaveLength(1)
+    expect(s.last()).toEqual({ kind: 'fix', source: 'draft', ...FIX_A })
+  })
+
+  test('a draft cached under one muted list misses after setMuted changes it', async () => {
+    const s = setup()
+    const { p } = await s.startDraftCall(A)
+    await answerA(s)
+    await p
+    await s.checker.poke(B)
+    s.checker.setMuted(['apostrophe'])
+    s.readText = A
+    await s.checker.poke(A)
+    const p2 = s.advance(1500)
+    await flush()
+    expect(s.calls).toHaveLength(2)
+    expect(s.calls[1].request.system).toContain('Do not report')
+    s.answer(1, '{"ok":true}')
+    await p2
+  })
+
+  test('submit uses the cache without an await, and misses after setMuted', async () => {
+    const s = setup()
+    const { p } = await s.startDraftCall(A)
+    await answerA(s)
+    await p
+    s.readText = ''
+    s.checker.submit(A) // not awaited
+    expect(s.last()).toEqual({ kind: 'fix', source: 'sent', ...FIX_A })
+    expect(s.calls).toHaveLength(1)
+
+    const t = setup()
+    const { p: q } = await t.startDraftCall(A)
+    await answerA(t)
+    await q
+    t.checker.setMuted(['spelling'])
+    t.checker.submit(A)
+    expect(t.calls).toHaveLength(2)
+  })
+
+  test('an unmute while a call is out caches the result under the muted list the call was made with', async () => {
+    const s = setup()
+    s.checker.setMuted(['apostrophe'])
+    const { p } = await s.startDraftCall(A)
+    s.checker.setMuted([]) // unmuted while the call is out
+    await answerA(s)
+    await p
+    await s.checker.poke(B)
+    s.readText = A
+    await s.checker.poke(A)
+    const p2 = s.advance(1500)
+    await flush()
+    expect(s.calls).toHaveLength(2) // the unmuted key does not hit the entry made with apostrophe muted
+    expect(s.calls[1].request.system).not.toContain('Do not report')
+    s.answer(1, '{"ok":true}')
+    await p2
   })
 })
 
