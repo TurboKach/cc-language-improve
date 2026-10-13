@@ -1,14 +1,21 @@
 # language-improve
 
-A Claude Code plugin (a "mod") that checks the English of your prompt while you write it. After a short pause, Haiku looks at the draft, and a band above the prompt lists the errors it found, each as a corrected sentence with a short reason, before you send the prompt:
+A Claude Code plugin (a "mod") that checks the English of your prompt while you write it. After a short pause, Haiku looks at the draft, and a band above the prompt shows your draft as one corrected text, with every fix applied, before you send the prompt. The band is short by default:
 
 ```
 ✎ English · I want you to check my text before I send it
-  want + object · verb form
-  a: mute word choice  s: mute verb forms  ctrl+x tab
+  m: more  ctrl+x tab
 ```
 
-Changed words are coloured and bold. When the draft has no errors the line reads `✓ English · no errors`. You can mute a kind of error you do not want to see (for example missing apostrophes) and bring it back with `/language-improve`. The only thing the mod saves is the list of muted kinds.
+Press `m` (after you focus the band) to also see a short reason for each kind of error and the mute buttons:
+
+```
+✎ English · I want you to check my text before I send it
+  grammar: want + object · verb form
+  m: less  a: mute verb forms  ctrl+x tab
+```
+
+Words the model changed or added are bold and coloured by the group of their error. Words it removed leave no mark. When the draft has no errors the line reads `✓ English · no errors`. You can mute a kind of error you do not want to see (for example missing apostrophes) and bring it back with `/language-improve`. The mod saves the list of muted kinds and whether the band is short or expanded.
 
 ## Requirements
 
@@ -41,7 +48,7 @@ Type or dictate a prompt as usual and pause. For example, type:
 I want that you checks my text before I sending it
 ```
 
-About 1.5 s after you stop, the band above the prompt shows each erroneous sentence corrected, with the reasons under it. With a longer draft, for example:
+About 1.5 s after you stop, the band above the prompt shows the whole draft corrected. With a longer draft, for example:
 
 ```
 I want that you checks my text. She go home. I dont know it. He have a dog.
@@ -50,21 +57,38 @@ I want that you checks my text. She go home. I dont know it. He have a dog.
 the band shows:
 
 ```
-✎ English · I want you to check my text.
-  want + object · verb form
-✎ She goes home.
-  agreement
-✎ I don't know it.
-  missing apostrophe
-  ‹ 1/2 ›  n: next  p: back  a: mute word choice  s: mute verb forms  d: mute agreement  f: mute apostrophes  ctrl+x tab
+✎ English · I want you to check my text. She goes home. I don't know it. He has a dog.
+  m: more  ctrl+x tab
 ```
 
-Fix the text yourself or send it as it is; the band never changes your prompt. It shows up to 8 errors, 3 for each page, in the order they appear in the draft. An edit that removes a flagged sentence drops that error; the others stay.
+Focus the band and press `m`, and the reasons and the mute buttons show under the text:
+
+```
+✎ English · I want you to check my text. She goes home. I don't know it. He has a dog.
+  grammar: want + object · verb form · agreement
+  punctuation: missing apostrophe
+  m: less  a: mute verb forms  s: mute agreement  d: mute apostrophes  ctrl+x tab
+```
+
+Press `m` again to go back to the short band. The band remembers your choice for the next drafts and the next sessions.
+
+Fix the text yourself or send it as it is; the band never changes your prompt. The changed words (`you to check`, `goes`, `don't`, `has`) are bold, each in the colour of its group. The text is your own draft; words more than 4 away from a change are cut, and each cut stretch shows as `…` (a `…` always hides at least 2 words). A fix that only removes words has no mark, but its place keeps 4 words of context on each side. A draft with no change shows its first 8 words. The band checks up to 8 errors, in the order they appear in the draft. An edit that removes a flagged sentence drops that error; the others stay.
+
+**Groups.** Each kind of error belongs to one group, with its own colour and its own reasons row:
+
+- grammar: verb forms, agreement, plural/singular, pronouns
+- small words: articles, prepositions
+- wording: word choice, word order
+- spelling: spelling, capitalization
+- punctuation: apostrophes, commas
+
+A change the model cannot name (`other`) is bold with no colour, and its reasons row is dim.
 
 **Keys.** The keys work after you focus the band: press ctrl+x then tab, or click it. Esc gives the keys back to the prompt.
 
-- `n` and `p` page forward and back (they wrap around). The `‹ 1/2 ›` text shows the page; it appears only when there is more than one.
-- The letters on the mute buttons (`a s d f g h j k l`, in that order) mute one kind of error: it leaves the band at once and is no longer reported. A toast confirms it. A kind the model cannot name (`other`) has no mute button.
+- `m` (the first button of the last row) shows or hides the reasons and the mute buttons. The band is short by default; the choice is saved, so the band starts as you left it, also after a restart. When the band has no reasons and no mute button to show, it has no `m` row.
+- The letters on the mute buttons (`a s d f g h j k l`, in that order) mute one kind of error: it leaves the band at once and is no longer reported. A toast confirms it. The mute buttons show only in the expanded band, so press `m` first. Each button is in the colour of its group. A kind the model cannot name (`other`) has no mute button.
+- A band taller than the room above the prompt scrolls. The letter keys work for buttons that have scrolled out of sight.
 - The kinds are articles, prepositions, verb forms, agreement, word order, word choice, plural/singular, pronouns, apostrophes, commas, spelling and capitalization.
 
 **Unmute.** Run `/language-improve` (it also works while Claude is answering). A pane lists the muted kinds, each with an `unmute` button and a letter key (`a s d f g h j k l z x c`). With nothing muted, it says so. Esc closes the pane. Mutes are saved, so they stay after a restart.
@@ -77,15 +101,15 @@ Fix the text yourself or send it as it is; the band never changes your prompt. I
 - **For good:** `/plugin uninstall language-improve@cc-language-improve`.
 - **For one session:** start Claude Code with `--safe-mode`. This also turns off your other customizations.
 
-The mod saves only the list of muted kinds (see [Privacy](#privacy)). To clear it, unmute each kind with `/language-improve`.
+The mod saves only the list of muted kinds and the short or expanded choice (see [Privacy](#privacy)). To clear the list, unmute each kind with `/language-improve`.
 
 ## How it works
 
 - **Change detection.** Two triggers share one code path. The `prompt.edit` hook fires on each edit in the prompt box. A 500 ms poll of the draft catches changes that do not fire `prompt.edit` (history recall, draft restore, `$.prompt.fill`, and possibly voice dictation).
 - **Pause.** 1.5 s after the last change, the draft is sent to Haiku (`$.model.complete`, on the session's credentials). A change while the call is in flight aborts it; an answer for an older draft is dropped.
-- **Answer.** The model returns a list of up to 8 erroneous sentences, in the order they appear in the draft. Each has its correction and its changes, and each change has a kind (one of the 12 above) and a short reason. The mod checks every error on its own: it drops one whose quoted sentence is not in the draft, one that changes nothing, a repeat, and one with no valid change. It reports real errors only (grammar, wrong word, spelling) and ignores code, paths, quoted text, URLs, chat-style capitalisation, missing final punctuation, and dictation fillers or restarts. Text that is not English is skipped.
+- **Answer.** The model returns a list of up to 8 erroneous sentences, in the order they appear in the draft. Each has its correction and its changes, and each change has a kind (one of the 12 above), the words the fix wrote and a short reason. The mod checks every error on its own: it drops one whose quoted sentence is not in the draft, one that changes nothing, a repeat, and one with no valid change. It reports real errors only (grammar, wrong word, spelling) and ignores code, paths, quoted text, URLs, chat-style capitalisation, missing final punctuation, and dictation fillers or restarts. Text that is not English is skipped.
 - **Muted kinds.** The system prompt tells the model not to report the muted kinds. The band also filters them when it draws, so a mute shows at once with no new model call. A muted kind is part of the cache key, so a mute or an unmute makes the next check ask again.
-- **Band.** The result is drawn in the `AbovePrompt` band in the look of the built-in you-should-know band: a blank row above, then for each error a `✎` (or `✓`) glyph in the theme's `suggestion` colour and the corrected text (the dim `English · ` tag is on the first error of each page), with the reasons indented under it. Under the errors is one row of buttons: page text and `n`/`p`, the mute buttons for the kinds on this page, and a dim `ctrl+x tab` hint. It yields to a survey, and keeps other mods' band content. When the band has little room, it drops the blank row first, then shows fewer errors on a page (3, 2, then 1). With 2 rows of room (`maxRows: 2`) it shows the first error with `+N more` and its reasons, with no buttons; with one row (`maxRows: 1`) the line and the reasons share a row. On a narrow terminal the button row drops the hint first, then mute buttons from the end. Every row is cut at the terminal width.
+- **Band.** The result is drawn in the `AbovePrompt` band in the look of the built-in you-should-know band: a blank row above, then a `✎` (or `✓`) glyph in the theme's `suggestion` colour, the dim `English · ` tag and one corrected text of the whole draft. Words the fixes changed or added are bold, in the theme colour of their group; removed words leave no mark. Words more than 4 words from a change are cut to a dim `…`, one for each stretch. The text wraps at the terminal width, and its continuation lines are indented 2. The band is short by default: the text, then one row with `m: more` and the dim `ctrl+x tab` hint. In the expanded band (press `m`; the choice is saved in the plugin store under `expanded`) the reasons rows come under the text, at most 4: every group that has a change gets its own row (`grammar: want + object · verb form`, in the group's colour), then a dim `other:` row for changes with no group. With 4 groups or fewer, the rows left over let the longer groups wrap at the terminal width with a 4-space indent, in order; a group longer than its rows ends in `…`. With more than 4 groups, the first 3 get one row each (cut with `…`) and the rest share the 4th row, each in its colour, cut with `…`. A word whose fix is of a muted kind is drawn plain. The last row of the expanded band holds `m: less`, the mute buttons for the kinds in the band (each label in its group's colour), and the dim `ctrl+x tab` hint. It yields to a survey, and keeps other mods' band content. When the rows do not all fit, the blank row goes first. A band that is still taller than its room scrolls; focus it (ctrl+x tab) to scroll. On a narrow terminal the last row drops the hint first, then mute buttons from the end; `m` stays while it fits. The shared reasons row and the last row are cut at the terminal width.
 - **Fast send.** If you press Enter before the pause ends, the sent text is checked at once and shown as `English · sent · …` (or `✓ English · sent · no errors`) until your next edit. Only your own Enter counts; task notifications, scheduled triggers, peers and plugins that submit prompts do not touch the checker. The check never delays your prompt.
 
 ## Skipped drafts (no model call)
@@ -106,14 +130,16 @@ At most one Haiku call per 1.5 s pause, plus one per fast send, billed to your p
 
 - Voice dictation: whether built-in voice mode fires `prompt.edit` is unconfirmed. The 500 ms poll should catch it either way; this is the one path to check by hand with your dictation tool.
 - No inline marks in the draft. No API paints the draft from a timer without moving the cursor, so the correction is shown above the prompt instead.
-- Up to 8 errors, 3 for each page. Past 8, the rest are not shown.
+- Up to 8 errors. Past 8, the rest are not corrected in the text.
+- The corrected text shows your whole draft, not one sentence. When the quoted sentence of an error cannot be found in the draft after the one before it, that error changes no text, but its reason is still listed.
 - The keys need the band in focus (ctrl+x tab or a click); a mod cannot bind a key inside the prompt box. Esc returns the keys to the prompt.
-- Mute buttons are trimmed from the end on a narrow terminal, and a page shows at most 9.
+- Mute buttons are trimmed from the end on a narrow terminal, and the band shows at most 9. Muting needs the expanded band.
+- A word is coloured by the words the model says each fix wrote. When it names none that match, the word takes the group of its error if all the fixes of that error are in one group, and is bold with no colour otherwise.
 - A mute from another open session reaches this one only after a restart. A mute never erases another session's mute.
 - After an unmute, the kind shows again only after your next edit: the result on screen was made without it.
 - The model labels each fix with a kind. A sentence with a muted fix and another fix may keep the muted fix's reason if the model labels it oddly. With apostrophes muted, the text check leaves apostrophe-only word changes alone, but a word fixed for both an apostrophe and capitals (`obrien` → `O'Brien`) is left as you typed it.
 - Shell commands typed in `!` mode are recognised by the model, not by a rule. A command with unusual prose may occasionally be checked; an ordinary sentence that starts with a program name may occasionally be skipped.
-- Each shown result belongs to the current draft: an edit that removes a flagged sentence drops that error, and when none are left the band clears.
+- Each shown result belongs to the current draft: an edit that removes a flagged sentence drops that error, and when none are left the band clears. The band shows the current draft with the fixes that still apply.
 - A prompt you just sent is not checked again if you recall it straight away (Up on the empty box): its `sent` result stays, and if that check failed nothing shows. Typing any other text first resets this.
 - Fast send uses the check of the draft you last paused on. If a history recall replaces the draft and you press Enter within half a second (before the poll sees the change), the `sent` line can belong to the earlier draft.
 
@@ -121,7 +147,7 @@ At most one Haiku call per 1.5 s pause, plus one per fast send, billed to your p
 
 - Your drafts are sent to Haiku through Claude Code's own model call (`$.model.complete`), on the same credentials and provider as your normal prompts. This includes drafts you never send.
 - Your drafts and results are never saved and the mod keeps no history. The current result lives in session state only and is cleared on restart.
-- The one thing the mod saves is the list of muted kinds (names such as `apostrophe`), in Claude Code's plugin store, so your mutes stay after a restart.
+- The mod saves two things, in Claude Code's plugin store: the list of muted kinds (names such as `apostrophe`) and whether the band is expanded. Both stay after a restart.
 - It makes no other network requests and runs no processes.
 
 ## Troubleshooting
@@ -136,22 +162,25 @@ At most one Haiku call per 1.5 s pause, plus one per fast send, billed to your p
 
 ## Manual test checklist
 
-Run this before a release, in a real terminal session with the mod loaded once: the installed copy, or `claude --plugin-dir .` with the installed copy disabled (see [Development](#development)). Only cases 5 and 6 send a prompt. Cases 10-14 change your saved mutes: unmute everything at the end.
+Run this before a release, in a real terminal session with the mod loaded once: the installed copy, or `claude --plugin-dir .` with the installed copy disabled (see [Development](#development)). Only cases 5 and 6 send a prompt. Cases 15 and 16 change the saved short or expanded choice: leave the band short at the end. Cases 10-14 and 17 change your saved mutes: unmute everything at the end.
 
-1. Type `I want that you checks my text before I sending it` and wait 2 s → a blank row, then a `✎ English · ` line with the corrected sentence (changed words green and bold) and, indented under it, a dim reason, then a row of mute buttons.
+1. Type `I want that you checks my text before I sending it` and wait 2 s → a blank row, then a `✎ English · ` line with the corrected sentence (changed words bold and coloured), then `m: more  ctrl+x tab`; no reasons and no mute buttons. Focus the band (ctrl+x then tab) and press `m` → a `grammar: …` reasons row in the same colour, then `m: less` and a row of mute buttons (the `mute verb forms` label in that colour).
 2. Add ` and also this` → the line updates or clears after the pause.
 3. Clear the box, paste `The weather is nice today and I am happy.` → `✓ English · no errors`.
 4. Clear, type `!` then `echo he go to school yesterday and me likes it` → no line (shell mode).
 5. Clear the box and leave shell mode (Backspace on the empty box until the `❯` glyph is back), then type the sentence from case 1 and press Enter at once → `✎ English · sent · …` while Claude answers; the prompt is not delayed.
 6. Submit `/help` → no line.
 7. Type a few words, clear the box, then press Up until an earlier prompt with an error shows → it is checked after the pause (this change does not fire `prompt.edit`, so it tests the 500 ms poll).
-8. Narrow the terminal to about 60 columns and repeat case 1 → both rows are cut with `…`, not wrapped, and the reason row keeps its 2-space indent (`✎ English · I want you to check my text before I send …`, then `  want + object · verb form`); the button row drops `ctrl+x tab`, then mute buttons from the end.
+8. Narrow the terminal to about 60 columns and repeat case 1 (expanded) → the corrected text wraps onto a second line with a 2-space indent and the `English · ` tag only on the first line; a long reasons row wraps with a 4-space indent, and the reasons never take more than 4 rows; the last row drops `ctrl+x tab`, then mute buttons from the end, and keeps `m: less`.
 9. Dictate a sentence with your voice tool → the line appears after the pause.
-10. Type `I want that you checks my text. She go home. I dont know it. He have a dog.` and wait 2 s → 3 stacked errors, `‹ 1/2 ›` and a row of mute buttons.
-11. Press ctrl+x then tab, then `n` → page 2 (`‹ 2/2 ›`, one error); `n` again → page 1; `p` → page 2. Esc returns the keys to the prompt.
-12. Focus the band and press the key of `mute apostrophes` → a toast reads `Muted apostrophes · /language-improve to unmute` and the `I don't know it.` error leaves the band.
+10. Type `I want that you checks my text. She go home. I dont know it. He have a dog.` and wait 2 s → one corrected text of the whole draft with the changed words bold in their group colours, a `grammar:` row and a `punctuation:` row, and, with the band expanded, a row of mute buttons; no paging text.
+11. Expand the band, then make the terminal short (or the draft long) so the band is taller than its room → the engine's scroll shows a part of it. Press ctrl+x then tab, then a mute key whose button is scrolled out → the toast shows and the band redraws. Esc returns the keys to the prompt.
+12. Expand the band, focus it and press the key of `mute apostrophes` → a toast reads `Muted apostrophes · /language-improve to unmute`, the `punctuation:` row goes and `don't` is drawn as `dont`, plain.
 13. Restart `claude`, type `i dont know where is the file` → no apostrophe fix, and the other errors still show.
-14. Run `/language-improve` → the pane lists `unmute apostrophes`; press its key → `Nothing is muted. Focus the band (ctrl+x tab) and press a mute key.`; Esc closes the pane.
+14. Run `/language-improve` → the pane lists `unmute apostrophes`; press its key → `Nothing is muted. Focus the band (ctrl+x tab), press m, then a mute key.`; Esc closes the pane.
+15. With a fresh store (or the band left short), type a draft with an error → only the text and `m: more  ctrl+x tab` show. Focus the band and press `m` → the reasons rows and the mute buttons show and the label reads `m: less`. Press `m` again → back to the text and `m: more`. Type another draft → the band keeps the mode you left.
+16. Press `m` so the band is expanded, quit `claude` and start it again, type a draft with an error → the band starts expanded. Press `m` to leave it short, restart, type a draft → it starts short.
+17. In the expanded band, mute a kind, press `m` to go short, then press `m` again → the muted kind is still gone from the reasons and the buttons.
 
 ## Development
 
@@ -165,10 +194,10 @@ Layout:
 .claude-plugin/plugin.json   manifest ("types": "./types/index.d.ts")
 .claude-plugin/marketplace.json  makes this folder the `cc-language-improve` marketplace
 hooks/hooks.json             { "modules": ["./register.js"] }
-hooks/register.js            wiring only: session.start (poll, /language-improve command), prompt.edit, prompt.submit, command.run, ui.render (band and `muted` pane)
+hooks/register.js            wiring only: session.start (poll, /language-improve command, the stored `muted` and `expanded`), prompt.edit, prompt.submit, command.run, ui.render (band and `muted` pane)
 hooks/checker.js             change detection, debounce, cache (draft and muted kinds), abort, stale drop, sent mode, per-error keep rule
 hooks/lib.js                 pure helpers: skip rules, kinds, system prompt, reply parser, muted filter, word diff, band rows
-types/index.d.ts             PluginState['language-improve'] = { view: View | null; muted: string[]; page: number }
+types/index.d.ts             PluginState['language-improve'] = { view: View | null; muted: string[]; expanded: boolean }
 tests/*.test.ts              lib, checker (fakes) and register (real hooks through the test kit)
 ```
 

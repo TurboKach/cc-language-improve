@@ -57,7 +57,8 @@ const mountTarget = (props: Record<string, unknown> = {}) =>
   }) as const
 
 // Registers every stub before the first `$` call, then starts the session.
-const boot = async ($: any, on: any, { isInteractive = true, reply = FIX, stored = [] as unknown } = {}) => {
+// The band starts expanded (`expanded` stored as true) so most tests see the reasons and the mute buttons; `null` stores nothing.
+const boot = async ($: any, on: any, { isInteractive = true, reply = FIX, stored = [] as unknown, expanded = true as boolean | null } = {}) => {
   const clock = mock.clock(on)
   // The plugin's store, in memory; a test edits `world.store` to play "another session".
   const world = {
@@ -70,6 +71,7 @@ const boot = async ($: any, on: any, { isInteractive = true, reply = FIX, stored
     opens: [] as any[],
     store: new Map<string, unknown>(stored === undefined ? [] : [['muted', stored]]),
   }
+  if (expanded !== null) world.store.set('expanded', expanded)
   on('store.get', (_$: any, e: any) => ({ value: world.store.get(e.key) }))
   on('store.set', (_$: any, e: any) => {
     world.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
@@ -111,7 +113,14 @@ const typeAndWait = async (clock: any, world: any, draft: string) => {
 
 // Our rows are the Texts with wrap 'truncate-end'; their nested Texts are the styled segments.
 const rowsOf = async (ui: any) => (await ui.findAll({ type: 'Text' })).filter((t: any) => t.props.wrap === 'truncate-end')
-const segmentsOf = async (ui: any) => (await ui.findAll({ type: 'Text' })).filter((t: any) => t.props.wrap === undefined && t.text !== 'OTHER')
+// The styled segments of our rows; a Button's label Text is not one.
+const segmentsOf = async (ui: any) => {
+  const labels = (await ui.findAll({ type: 'Button' })).map((b: any) => b.text)
+  return (await ui.findAll({ type: 'Text' })).filter((t: any) => t.props.wrap === undefined && t.text !== 'OTHER' && !labels.includes(t.text))
+}
+// A Button's label Text, with its color.
+const labelColor = async (ui: any, label: string) =>
+  (await ui.findAll({ type: 'Text' })).find((t: any) => t.text === label && t.props.wrap === undefined)?.props.color
 
 describe('AbovePrompt band', () => {
   test('yields to other mods with no view', async ($, on) => {
@@ -122,7 +131,7 @@ describe('AbovePrompt band', () => {
     expect(await ui.find({ type: 'Text', text: 'no errors' })).toBeUndefined()
   })
 
-  test('shows the corrected sentence with styled changes and a dim reason after a poll-detected draft and 1.5 s', async ($, on) => {
+  test('shows the fixed text, a reason row per group and colored mute buttons after a poll-detected draft and 1.5 s', async ($, on) => {
     const { clock, world } = await boot($, on)
     await typeAndWait(clock, world, DRAFT)
     expect(world.requests).toHaveLength(1)
@@ -133,35 +142,53 @@ describe('AbovePrompt band', () => {
     const rows = (await rowsOf(ui)).filter((r: any) => r.text !== 'OTHER')
     expect(rows.map((r: any) => r.text)).toEqual([
       '✎ English · I want you to check my text.',
-      '  want + object · verb form',
+      '  grammar: verb form',
+      '  wording: want + object',
     ])
     const segments = await segmentsOf(ui)
-    const added = segments.filter((s: any) => s.props.color === 'diffAddedWord')
-    expect(added.length).toBeGreaterThan(0)
-    expect(added.every((s: any) => s.props.bold === true)).toBe(true)
-    expect(added.map((s: any) => s.text).join(' ')).toContain('check')
-    expect(segments.some((s: any) => s.text === 'want + object · verb form' && s.props.dimColor === true)).toBe(true)
+    // The two fixes are of different groups and the reply names no words: bold, no color.
+    const changed = segments.filter((s: any) => s.props.bold === true)
+    expect(changed.map((s: any) => s.text).join(' ')).toContain('check')
+    expect(changed.every((s: any) => s.props.color === undefined)).toBe(true)
+    expect(segments.some((s: any) => s.text === 'grammar: verb form' && s.props.color === 'warning')).toBe(true)
+    expect(segments.some((s: any) => s.text === 'wording: want + object' && s.props.color === 'autoAccept')).toBe(true)
+    expect(await labelColor(ui, 'mute word choice')).toBe('autoAccept')
+    expect(await labelColor(ui, 'mute verb forms')).toBe('warning')
     expect(segments.some((s: any) => s.text.includes('more'))).toBe(false)
   })
 
-  test('shows "+N more" in the compact form at maxRows: 2', async ($, on) => {
-    const { clock, world } = await boot($, on, { reply: MORE })
-    await typeAndWait(clock, world, MORE_DRAFT)
-    const ui = await $.ui.mount(mountTarget({ maxRows: 2 }))
-    const segments = await segmentsOf(ui)
-    expect(segments.some((s: any) => s.text === '  +2 more' && s.props.dimColor === true)).toBe(true)
+  test('a changed word is in the color of the group of the change that wrote it', async ($, on) => {
+    const named = {
+      ...ERROR,
+      changes: [
+        { kind: 'word-choice', words: 'you to', why: 'want + object' },
+        { kind: 'verb-form', words: 'check', why: 'verb form' },
+      ],
+    }
+    const { clock, world } = await boot($, on, { reply: JSON.stringify({ errors: [named] }) })
+    await typeAndWait(clock, world, DRAFT)
+    const segments = await segmentsOf(await $.ui.mount(mountTarget()))
+    expect(segments.filter((s: any) => s.props.bold === true).map((s: any) => [s.text, s.props.color])).toEqual([
+      ['to', 'autoAccept'],
+      ['check', 'warning'],
+    ])
   })
 
-  test('at maxRows: 3 one error shows with the page text and no "+N more"', async ($, on) => {
+  test('a band taller than maxRows is drawn whole, for the engine to scroll', async ($, on) => {
     const { clock, world } = await boot($, on, { reply: MORE })
     await typeAndWait(clock, world, MORE_DRAFT)
-    const ui = await $.ui.mount(mountTarget())
-    expect(await ui.find({ type: 'Text', text: '‹ 1/3 ›' })).toBeDefined()
-    expect((await rowsOf(ui)).map((r: any) => r.text).filter((t: string) => t !== 'OTHER')).toEqual([
-      '✎ English · I want you to check my text.',
-      '  want + object · verb form',
-    ])
-    expect((await segmentsOf(ui)).some((s: any) => s.text.includes('more'))).toBe(false)
+    for (const maxRows of [3, 2, 1]) {
+      const ui = await $.ui.mount(mountTarget({ maxRows }))
+      expect((await rowsOf(ui)).map((r: any) => r.text).filter((t: string) => t !== 'OTHER')).toEqual([
+        '✎ English · I want you to check my text. She goes home. He has a dog.',
+        '  grammar: verb form · agreement',
+        '  wording: want + object',
+      ])
+      expect(await ui.find({ key: 'mute:agreement' })).toBeDefined()
+      expect((await ui.findAll({ type: 'Box' })).some((b: any) => b.props.marginTop === 1)).toBe(false)
+      expect((await segmentsOf(ui)).some((s: any) => s.text.includes('more'))).toBe(false)
+      await ui.unmount()
+    }
   })
 
   test('shows "✓ no errors" for an ok reply', async ($, on) => {
@@ -177,14 +204,6 @@ describe('AbovePrompt band', () => {
     expect((await rowsOf(ui)).filter((r: any) => r.text === '✓ English · no errors')).toHaveLength(1)
   })
 
-  test('puts both parts on one row at maxRows: 1', async ($, on) => {
-    const { clock, world } = await boot($, on)
-    await typeAndWait(clock, world, DRAFT)
-    const ui = await $.ui.mount(mountTarget({ maxRows: 1 }))
-    const rows = (await rowsOf(ui)).filter((r: any) => r.text !== 'OTHER')
-    expect(rows.map((r: any) => r.text)).toEqual(['✎ English · I want you to check my text. · want + object · verb form'])
-  })
-
   test('emits none of its rows at maxRows: 0 and yields the band', async ($, on) => {
     const { clock, world } = await boot($, on)
     await typeAndWait(clock, world, DRAFT)
@@ -194,17 +213,17 @@ describe('AbovePrompt band', () => {
     expect((await rowsOf(ui)).filter((r: any) => r.text !== 'OTHER')).toHaveLength(0)
   })
 
-  test('never emits more rows than maxRows', async ($, on) => {
+  test('the gap row shows only when it and every row fit in maxRows', async ($, on) => {
     const { clock, world } = await boot($, on, { reply: MANY })
     await typeAndWait(clock, world, MANY_DRAFT)
-    for (const maxRows of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
-      const ui = await $.ui.mount(mountTarget({ maxRows }))
-      // Our rows: the text rows, and the action row (the one row-direction Box).
+    // Text row, 3 reasons rows (grammar, wording, punctuation), the action row.
+    for (const maxRows of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      const ui = await $.ui.mount(mountTarget({ maxRows, bodyColumns: WIDE }))
       const actionRows = (await ui.findAll({ type: 'Box' })).filter((b: any) => b.props.flexDirection === 'row').length
       const rows = (await rowsOf(ui)).filter((r: any) => r.text !== 'OTHER').length + actionRows
-      // Our Box is the one that carries marginTop.
-      const gap = (await ui.findAll({ type: 'Box' })).some((b: any) => b.props.marginTop === 1) ? 1 : 0
-      expect(rows + gap).toBeLessThanOrEqual(maxRows)
+      const gap = (await ui.findAll({ type: 'Box' })).some((b: any) => b.props.marginTop === 1)
+      expect(rows).toBe(5)
+      expect(gap).toBe(maxRows >= 6)
       await ui.unmount()
     }
   })
@@ -226,7 +245,7 @@ describe('AbovePrompt band', () => {
   })
 })
 
-describe('stacked band, paging and mute', () => {
+describe('stacked band and mute', () => {
   const bandTexts = async (ui: any) =>
     (await rowsOf(ui)).map((r: any) => r.text).filter((t: string) => t !== 'OTHER')
   const manyBand = async ($: any, on: any, options = {}) => {
@@ -235,27 +254,27 @@ describe('stacked band, paging and mute', () => {
     return booted
   }
 
-  test('4 errors at maxRows 10: 3 errors, the action row and the page text', async ($, on) => {
+  test('4 errors at maxRows 10: one text, a reasons row per group, the mute buttons and the hint', async ($, on) => {
     await manyBand($, on)
     const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
     expect(await bandTexts(ui)).toEqual([
-      '✎ English · I want you to check my text.',
-      '  want + object · verb form',
-      '✎ She goes home.',
-      '  agreement',
-      "✎ I don't know it.",
-      '  missing apostrophe',
+      "✎ English · I want you to check my text. She goes home. I don't know it. He has a dog.",
+      '  grammar: verb form · agreement',
+      '  wording: want + object',
+      '  punctuation: missing apostrophe',
     ])
-    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'ctrl+x tab' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'OTHER' })).toBeDefined()
     const hotkeys = async (key: string) => (await ui.find({ key }))?.props.hotkey
-    expect(await hotkeys('page:next')).toBe('n')
-    expect(await hotkeys('page:back')).toBe('p')
     expect(await hotkeys('mute:word-choice')).toBe('a')
     expect(await hotkeys('mute:verb-form')).toBe('s')
     expect(await hotkeys('mute:agreement')).toBe('d')
     expect(await hotkeys('mute:apostrophe')).toBe('f')
+    expect(await labelColor(ui, 'mute word choice')).toBe('autoAccept')
+    expect(await labelColor(ui, 'mute verb forms')).toBe('warning')
+    expect(await labelColor(ui, 'mute agreement')).toBe('warning')
+    expect(await labelColor(ui, 'mute apostrophes')).toBe('claude')
+    expect((await ui.findAll({ type: 'Button' })).filter((b: any) => String(b.props.key).startsWith('page'))).toHaveLength(0)
   })
 
   test('the Buttons are plain and use letter hotkeys only', async ($, on) => {
@@ -272,29 +291,17 @@ describe('stacked band, paging and mute', () => {
     }
   })
 
-  test('page:next goes to page 2, wraps to page 1; page:back wraps and returns', async ($, on) => {
-    await manyBand($, on)
-    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
-    await ui.press({ key: 'page:next' })
-    expect(await bandTexts(ui)).toEqual(['✎ English · He has a dog.', '  agreement'])
-    expect(await ui.find({ type: 'Text', text: '‹ 2/2 ›' })).toBeDefined()
-    await ui.press({ key: 'page:next' })
-    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeDefined()
-    expect((await bandTexts(ui))[0]).toBe('✎ English · I want you to check my text.')
-    await ui.press({ key: 'page:back' })
-    expect(await ui.find({ type: 'Text', text: '‹ 2/2 ›' })).toBeDefined()
-    await ui.press({ key: 'page:back' })
-    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeDefined()
-  })
-
-  test('a new view starts on page 1', async ($, on) => {
+  test('an edit that keeps every error redraws the same rows with the new text', async ($, on) => {
     const { clock, world } = await manyBand($, on)
     const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
-    await ui.press({ key: 'page:next' })
-    expect(await ui.find({ type: 'Text', text: '‹ 2/2 ›' })).toBeDefined()
-    world.reply = MANY
-    await typeAndWait(clock, world, `${MANY_DRAFT} Fine.`)
-    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeDefined()
+    const before = await bandTexts(ui)
+    world.draft = `${MANY_DRAFT} Fine.`
+    await clock.advance(500) // the poll sees the edit; the new check has not started
+    expect(world.requests).toHaveLength(1)
+    const after = await bandTexts(ui)
+    expect(after[0]).toBe(`${before[0]} Fine.`)
+    expect(after.slice(1)).toEqual(before.slice(1))
+    expect(await ui.find({ key: 'mute:apostrophe' })).toBeDefined()
   })
 
   test('muting a kind redraws without it, stores it, toasts, and tells the model', async ($, on) => {
@@ -302,15 +309,11 @@ describe('stacked band, paging and mute', () => {
     const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
     await ui.press({ key: 'mute:apostrophe' })
     expect(await bandTexts(ui)).toEqual([
-      '✎ English · I want you to check my text.',
-      '  want + object · verb form',
-      '✎ She goes home.',
-      '  agreement',
-      '✎ He has a dog.',
-      '  agreement',
+      "✎ English · I want you to check my text. She goes home. I dont know it. He has a dog.",
+      '  grammar: verb form · agreement',
+      '  wording: want + object',
     ])
     expect(await ui.find({ key: 'mute:apostrophe' })).toBeUndefined()
-    expect(await ui.find({ type: 'Text', text: '‹ 1/2 ›' })).toBeUndefined()
     expect(world.store.get('muted')).toEqual(['apostrophe'])
     expect(world.toasts).toEqual(['Muted apostrophes · /language-improve to unmute'])
 
@@ -336,7 +339,7 @@ describe('stacked band, paging and mute', () => {
     await typeAndWait(clock, world, DRAFT)
     const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
     await ui.press({ key: 'mute:word-choice' })
-    expect(await bandTexts(ui)).toEqual(['✎ English · I want you to check my text.', '  verb form'])
+    expect(await bandTexts(ui)).toEqual(['✎ English · I want you to check my text.', '  grammar: verb form'])
     await ui.press({ key: 'mute:verb-form' })
     expect(await bandTexts(ui)).toEqual(['✓ English · no errors'])
     expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
@@ -358,23 +361,107 @@ describe('stacked band, paging and mute', () => {
     expect(world.requests[0].system).not.toContain('Do not report')
   })
 
-  test('a narrow band drops the hint first, then mute buttons from the end', async ($, on) => {
+  test('a narrow band cuts mute buttons from the end and drops the hint first', async ($, on) => {
     await manyBand($, on)
     const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: 60 }))
     expect(await ui.find({ type: 'Text', text: 'ctrl+x tab' })).toBeUndefined()
+    expect(await ui.find({ key: 'toggle' })).toBeDefined()
     expect(await ui.find({ key: 'mute:word-choice' })).toBeDefined()
-    expect(await ui.find({ key: 'mute:apostrophe' })).toBeUndefined()
-    expect(await ui.find({ key: 'page:next' })).toBeDefined()
+    expect(await ui.find({ key: 'mute:verb-form' })).toBeDefined()
+    expect(await ui.find({ key: 'mute:agreement' })).toBeUndefined()
   })
 
-  test('maxRows 2 and 1 keep the compact forms with no Buttons', async ($, on) => {
+  test('at 45 columns the cut buttons leave room for the hint, which is drawn', async ($, on) => {
     await manyBand($, on)
-    for (const maxRows of [2, 1]) {
-      const ui = await $.ui.mount(mountTarget({ maxRows }))
-      expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
-      expect((await bandTexts(ui)).length).toBe(maxRows)
-      await ui.unmount()
-    }
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: 45 }))
+    expect(await ui.find({ key: 'mute:word-choice' })).toBeDefined()
+    expect(await ui.find({ key: 'mute:verb-form' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'ctrl+x tab' })).toBeDefined()
+  })
+
+  test('with no room for even one mute button the band draws the toggle alone', async ($, on) => {
+    await manyBand($, on)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: 10 }))
+    expect((await ui.findAll({ type: 'Button' })).map((b: any) => b.props.key)).toEqual(['toggle'])
+    expect((await bandTexts(ui)).length).toBeGreaterThan(1)
+  })
+})
+
+describe('minimal and expanded', () => {
+  const bandTexts = async (ui: any) => (await rowsOf(ui)).map((r: any) => r.text).filter((t: string) => t !== 'OTHER')
+  const start = async ($: any, on: any, options = {}) => {
+    const booted = await boot($, on, options)
+    await typeAndWait(booted.clock, booted.world, DRAFT)
+    return booted
+  }
+
+  test('a fresh session starts minimal: the fixed text and the toggle, no reasons, no mute Button', async ($, on) => {
+    await start($, on, { expanded: null })
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    expect(await bandTexts(ui)).toEqual(['✎ English · I want you to check my text.'])
+    const buttons = await ui.findAll({ type: 'Button' })
+    expect(buttons.map((b: any) => [b.props.key, b.props.hotkey, b.props.plain])).toEqual([['toggle', 'm', true]])
+    expect(await labelColor(ui, 'more')).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'more' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'ctrl+x tab' })).toBeDefined()
+  })
+
+  test('pressing the toggle shows the reasons and the mute Buttons, and stores expanded: true', async ($, on) => {
+    const { world } = await start($, on, { expanded: null })
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    await ui.press({ key: 'toggle' })
+    expect(await bandTexts(ui)).toEqual(['✎ English · I want you to check my text.', '  grammar: verb form', '  wording: want + object'])
+    expect((await ui.findAll({ type: 'Button' })).map((b: any) => b.props.key)).toEqual(['toggle', 'mute:word-choice', 'mute:verb-form'])
+    expect(await ui.find({ type: 'Text', text: 'less' })).toBeDefined()
+    expect(world.store.get('expanded')).toBe(true)
+  })
+
+  test('a new session with expanded stored starts expanded', async ($, on) => {
+    await start($, on, { expanded: true })
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    expect((await bandTexts(ui)).length).toBe(3)
+    expect(await ui.find({ key: 'mute:verb-form' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'less' })).toBeDefined()
+  })
+
+  test('a stored value that is not true starts minimal', async ($, on) => {
+    await start($, on, { expanded: 'yes' as any })
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    expect(await bandTexts(ui)).toHaveLength(1)
+  })
+
+  test('pressing less returns to minimal and stores false', async ($, on) => {
+    const { world } = await start($, on)
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    await ui.press({ key: 'toggle' })
+    expect(await bandTexts(ui)).toEqual(['✎ English · I want you to check my text.'])
+    expect(await ui.find({ key: 'mute:verb-form' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'more' })).toBeDefined()
+    expect(world.store.get('expanded')).toBe(false)
+  })
+
+  test('the mode is remembered across drafts', async ($, on) => {
+    const { clock, world } = await start($, on, { expanded: null })
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    await ui.press({ key: 'toggle' })
+    await typeAndWait(clock, world, `${DRAFT} Fine.`)
+    expect((await bandTexts(ui)).length).toBe(3)
+  })
+
+  test('muting works from the expanded view reached with the toggle', async ($, on) => {
+    const { world } = await start($, on, { expanded: null })
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: WIDE }))
+    await ui.press({ key: 'toggle' })
+    await ui.press({ key: 'mute:word-choice' })
+    expect(world.store.get('muted')).toEqual(['word-choice'])
+    expect(await bandTexts(ui)).toEqual(['✎ English · I want you to check my text.', '  grammar: verb form'])
+    expect(await ui.find({ key: 'toggle' })).toBeDefined()
+  })
+
+  test('minimal draws the toggle even at the width where no mute button fits', async ($, on) => {
+    await start($, on, { expanded: null })
+    const ui = await $.ui.mount(mountTarget({ maxRows: 10, bodyColumns: 12 }))
+    expect((await ui.findAll({ type: 'Button' })).map((b: any) => b.props.key)).toEqual(['toggle'])
   })
 })
 
@@ -448,14 +535,14 @@ describe('/language-improve pane', () => {
     const ui = await $.ui.mount(paneTarget())
     await ui.press({ key: 'unmute:apostrophe' })
     expect(world.store.get('muted')).toEqual([])
-    expect(await ui.find({ type: 'Text', text: 'Nothing is muted. Focus the band (ctrl+x tab) and press a mute key.' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Nothing is muted. Focus the band (ctrl+x tab), press m, then a mute key.' })).toBeDefined()
     expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
   })
 
   test('with nothing muted the pane shows the empty line', async ($, on) => {
     await boot($, on)
     const ui = await $.ui.mount(paneTarget())
-    expect(await ui.find({ type: 'Text', text: 'Nothing is muted. Focus the band (ctrl+x tab) and press a mute key.' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Nothing is muted. Focus the band (ctrl+x tab), press m, then a mute key.' })).toBeDefined()
     expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
   })
 })

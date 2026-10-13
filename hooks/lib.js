@@ -24,6 +24,21 @@ export const KINDS = [
   { slug: 'capitalization', label: 'capitalization' },
 ]
 
+/**
+ * Error groups, one color each, as `{ slug, label, color, kinds }`. `color` is
+ * a theme key. Each of the 12 kinds is in one group; `other` is in none.
+ */
+export const GROUPS = [
+  { slug: 'grammar', label: 'grammar', color: 'warning', kinds: ['verb-form', 'agreement', 'number', 'pronoun'] },
+  { slug: 'small-words', label: 'small words', color: 'ide', kinds: ['article', 'preposition'] },
+  { slug: 'wording', label: 'wording', color: 'autoAccept', kinds: ['word-choice', 'word-order'] },
+  { slug: 'spelling', label: 'spelling', color: 'success', kinds: ['spelling', 'capitalization'] },
+  { slug: 'punctuation', label: 'punctuation', color: 'claude', kinds: ['apostrophe', 'comma'] },
+]
+
+/** The group of an error kind, or null for `other` and unknown kinds. */
+export const groupOf = (kind) => GROUPS.find((g) => g.kinds.includes(kind)) ?? null
+
 const MAX_ERRORS = 8
 const MAX_CHANGES = 6
 
@@ -45,9 +60,9 @@ Keep the writer's meaning and wording. Change the minimum needed to fix each err
 Reply with JSON only, no other text, in one of these shapes:
 {"ok":true}
 {"skip":true}
-{"errors":[{"original":"<exact sentence from the text>","corrected":"<the same sentence, fixed>","changes":[{"kind":"<kind>","why":"<at most 8 words>"}]}]}
+{"errors":[{"original":"<exact sentence from the text>","corrected":"<the same sentence, fixed>","changes":[{"kind":"<kind>","words":"<the words of corrected this fix wrote>","why":"<at most 8 words>"}]}]}
 
-List each erroneous sentence once, in the order it appears in the text, at most ${MAX_ERRORS} errors. "changes" has one entry for each fix in that sentence.
+List each erroneous sentence once, in the order it appears in the text, at most ${MAX_ERRORS} errors. "changes" has one entry for each fix in that sentence. "words" is the words of "corrected" that the fix wrote, copied exactly; empty when the fix only removes words.
 "kind" is one of: ${KINDS.map((k) => k.slug).join(', ')}, other.`
 }
 
@@ -91,20 +106,24 @@ export const prepareDraft = (draft) => {
 
 const isWordChar = (ch) => /[\p{L}\p{N}_]/u.test(ch)
 
+// Index of the first occurrence of `quote` in `text` at or after `from` as
+// whole words: the characters just outside the match are not word characters.
+// -1 when there is none.
+const findWordRun = (text, quote, from) => {
+  for (let at = text.indexOf(quote, from); at >= 0; at = text.indexOf(quote, at + 1)) {
+    const before = at === 0 ? '' : text[at - 1]
+    const after = text[at + quote.length] ?? ''
+    if (!isWordChar(before) && !isWordChar(after)) return at
+  }
+  return -1
+}
+
 /**
  * True when `quote` occurs in `text` as a run of 2 or more whole words: the
  * characters just outside the match are not word characters. Both are
  * expected whitespace-normalized.
  */
-export const containsWordRun = (text, quote) => {
-  if (countWords(quote) < 2) return false
-  for (let at = text.indexOf(quote); at >= 0; at = text.indexOf(quote, at + 1)) {
-    const before = at === 0 ? '' : text[at - 1]
-    const after = text[at + quote.length] ?? ''
-    if (!isWordChar(before) && !isWordChar(after)) return true
-  }
-  return false
-}
+export const containsWordRun = (text, quote) => countWords(quote) >= 2 && findWordRun(text, quote, 0) >= 0
 
 // First balanced {...} object in the text, honouring JSON strings; null when
 // there is none or it is cut off.
@@ -127,10 +146,13 @@ const firstObject = (reply) => {
 
 const KIND_SLUGS = new Set(KINDS.map((k) => k.slug))
 
-// One change from the reply, or null when it has no string `why`.
+// One change from the reply, or null when it has no string `why`. `words` is
+// kept only when it is a non-empty string.
 const parseChange = (change) => {
   if (change === null || typeof change !== 'object' || typeof change.why !== 'string') return null
-  return { kind: KIND_SLUGS.has(change.kind) ? change.kind : 'other', why: normalizeWhitespace(change.why) }
+  const parsed = { kind: KIND_SLUGS.has(change.kind) ? change.kind : 'other', why: normalizeWhitespace(change.why) }
+  const words = typeof change.words === 'string' ? normalizeWhitespace(change.words) : ''
+  return words === '' ? parsed : { ...parsed, words }
 }
 
 // One error from the reply, or null when it is not usable against `sent`.
@@ -148,7 +170,7 @@ const parseError = (error, sent) => {
 
 /**
  * Parses the model's reply against the text that was sent.
- * Returns 'ok', 'skip', `{ errors: [{ original, corrected, changes: [{ kind, why }] }] }`,
+ * Returns 'ok', 'skip', `{ errors: [{ original, corrected, changes: [{ kind, why, words? }] }] }`,
  * or null (show nothing). Each error is checked on its own; unusable ones are
  * dropped, and at most 8 are kept.
  */
@@ -274,60 +296,179 @@ export const visibleErrors = (errors, muted) => {
     .filter((e) => wordsOf(e.corrected).join(' ') !== wordsOf(e.original).join(' '))
 }
 
+// The corrected words as `{ word, changed }`, and `removedAt`: for each deleted
+// word, how many corrected words come before it. Over 200 words either side: nothing marked.
+const diffMarks = (original, corrected) => {
+  const a = wordsOf(original)
+  const b = wordsOf(corrected)
+  if (a.length > MAX_DIFF_WORDS || b.length > MAX_DIFF_WORDS) return { words: b.map((word) => ({ word, changed: false })), removedAt: [] }
+  const words = []
+  const removedAt = []
+  for (const op of alignWords(a, b)) {
+    if (op.type === 'del') removedAt.push(words.length)
+    else words.push({ word: b[op.j], changed: op.type === 'ins' })
+  }
+  return { words, removedAt }
+}
+
 /**
  * Word-level diff of original -> corrected.
  * Returns the corrected words as `{ word, changed }`; `changed` marks words
  * inserted or replaced. A deletion leaves nothing to mark. Over 200 words on
  * either side, nothing is marked.
  */
-export const diffWords = (original, corrected) => {
-  const a = wordsOf(original)
-  const b = wordsOf(corrected)
-  if (a.length > MAX_DIFF_WORDS || b.length > MAX_DIFF_WORDS) {
-    return b.map((word) => ({ word, changed: false }))
-  }
-  return alignWords(a, b)
-    .filter((op) => op.type !== 'del')
-    .map((op) => ({ word: b[op.j], changed: op.type === 'ins' }))
-}
+export const diffWords = (original, corrected) => diffMarks(original, corrected).words
 
 const DIM = { dimColor: true }
 const ACCENT = { color: 'suggestion' }
-const CHANGED = { color: 'diffAddedWord', bold: true }
 
-// The corrected sentence as segments: runs of equal styling merged.
-const sentenceSegments = (original, corrected) => {
-  const segments = []
-  for (const { word, changed } of diffWords(original, corrected)) {
-    const style = changed ? CHANGED : {}
-    const prev = segments[segments.length - 1]
-    if (prev && prev.changed === changed) prev.text += ` ${word}`
-    else segments.push({ text: segments.length ? ` ${word}` : word, style, changed })
+const CONTEXT = 4
+const MIN_COLUMNS = 20
+const ELLIPSIS = '…'
+const NEUTRAL = { bold: true }
+
+// A word without the punctuation round it, lower-cased; a word of punctuation only stays whole.
+const bareWord = (w) => (w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '') || w).toLowerCase()
+
+// The style of one changed word of `visible`, whose unreverted original is `raw`.
+const changedStyle = (word, raw, visible, muted) => {
+  const key = bareWord(word)
+  const hit = raw.changes.find((c) => c.words !== undefined && wordsOf(c.words).some((w) => bareWord(w) === key))
+  if (hit) {
+    if (muted.includes(hit.kind)) return {}
+    const group = groupOf(hit.kind)
+    return group ? { color: group.color, bold: true } : NEUTRAL
   }
-  return segments.map(({ text, style }) => ({ text, style }))
+  if (visible.changes.length === 0 || raw.changes.some((c) => muted.includes(c.kind))) return NEUTRAL
+  const groups = new Set(raw.changes.map((c) => groupOf(c.kind)))
+  const [only] = groups
+  return groups.size === 1 && only ? { color: only.color, bold: true } : NEUTRAL
+}
+
+/**
+ * The draft with the fixes of the visible errors spliced in, as tokens
+ * `{ text, space, style }`: `space` says whether one space precedes the token,
+ * and tokens also break at the edges of a splice, so text kept next to a fix
+ * (`text,` or `(I`) keeps its exact characters. `text` and the raw `errors`
+ * are the view's; `muted` is a list of kind slugs. Each visible error goes at
+ * the first whole-word occurrence of its `original` at or after the end of the
+ * one before; one that is not found changes no text. A changed word is styled
+ * from the raw change whose `words` holds it: its group's color and bold; plain
+ * for a muted kind; bold alone for `other`. With no such change, the group
+ * shared by all the raw changes of its error (none muted) colors it, else bold
+ * alone. Unchanged tokens farther than 4 from a changed one, or from the place
+ * of a removal (which draws no mark), become one dim `…` per stretch; a stretch
+ * of one token is shown. With neither, the first 8 tokens are kept and the rest
+ * become one `…` (nothing is cut at 9 tokens or fewer).
+ */
+export const fixedTokens = (text, errors, muted) => {
+  const tokens = []
+  let space = false
+  // Unchanged text, cut at its spaces; a space at either end waits for the next token.
+  const pushText = (s) => {
+    s.split(' ').forEach((part, k) => {
+      if (k > 0) space = true
+      if (part === '') return
+      tokens.push({ text: part, space, style: {}, changed: false })
+      space = false
+    })
+  }
+
+  const removals = []
+  let cursor = 0
+  for (const raw of errors) {
+    for (const visible of visibleErrors([raw], muted)) {
+      const at = findWordRun(text, visible.original, cursor)
+      if (at < 0) continue
+      pushText(text.slice(cursor, at))
+      const { words, removedAt } = diffMarks(visible.original, visible.corrected)
+      removedAt.forEach((k) => removals.push(tokens.length + k))
+      words.forEach(({ word, changed }, k) => {
+        const style = changed ? changedStyle(word, raw, visible, muted) : {}
+        tokens.push({ text: word, space: k > 0 || space, style, changed })
+      })
+      space = false
+      cursor = at + visible.original.length
+    }
+  }
+  pushText(text.slice(cursor))
+
+  const keep = tokens.map(() => false)
+  const around = (from, to) => keep.fill(true, Math.max(0, from), Math.min(tokens.length, to))
+  tokens.forEach((t, i) => {
+    if (t.changed) around(i - CONTEXT, i + CONTEXT + 1)
+  })
+  // A removal leaves no token: the point between the tokens either side of it is the centre.
+  removals.forEach((p) => around(p - CONTEXT, p + CONTEXT))
+  if (!keep.includes(true)) around(0, 2 * CONTEXT)
+  // A `…` hides at least two tokens: a stretch of one stays.
+  keep.forEach((k, i) => {
+    if (!k && (i === 0 || keep[i - 1]) && (i === keep.length - 1 || keep[i + 1])) keep[i] = true
+  })
+  const shown = []
+  tokens.forEach((t, i) => {
+    if (keep[i]) shown.push({ text: t.text, space: t.space, style: t.style })
+    else if (i === 0 || keep[i - 1]) shown.push({ text: ELLIPSIS, space: t.space, style: DIM })
+  })
+  return shown
+}
+
+/**
+ * Greedy line wrap of tokens `{ text, space, style }` into lines of tokens.
+ * A token with no space before it stays on the line of the one before it,
+ * unless it has `breakBefore: true` (the line may break there, with no space). The
+ * first line holds the tokens from the start, so put the `✎ ` and tag tokens
+ * first; the lines after it start after `indent` columns, which the caller
+ * prints. A token at a line start has `space: false`. Width counts `.length`;
+ * `columns` under 20 is read as 20. A token wider than a line gets a line to
+ * itself.
+ */
+export const wrapTokens = (tokens, columns, indent) => {
+  const limit = Math.max(columns, MIN_COLUMNS)
+  const units = []
+  for (const t of tokens) {
+    if (units.length > 0 && !t.space && !t.breakBefore) units[units.length - 1].push(t)
+    else units.push([t])
+  }
+  const lines = [[]]
+  let used = 0
+  for (const unit of units) {
+    const width = unit.reduce((sum, t) => sum + t.text.length, 0)
+    let line = lines[lines.length - 1]
+    let lead = line.length > 0 && unit[0].space ? 1 : 0
+    if (line.length > 0 && used + lead + width > limit) {
+      line = []
+      lines.push(line)
+      used = indent
+      lead = 0
+    }
+    line.push({ ...unit[0], space: lead === 1 }, ...unit.slice(1))
+    used += lead + width
+  }
+  return lines[0].length > 0 ? lines : []
+}
+
+/**
+ * The reasons of visible errors by group, as `[{ group, whys }]`: one entry per
+ * group that has a change, in `GROUPS` order, then `group: null` for `other`
+ * and unknown kinds. A reason repeated in a group is listed once.
+ */
+export const groupReasons = (errors) => {
+  const changes = errors.flatMap((e) => e.changes)
+  return [...GROUPS, null]
+    .map((group) => ({ group, whys: [...new Set(changes.filter((c) => groupOf(c.kind) === group).map((c) => c.why))] }))
+    .filter((r) => r.whys.length > 0)
 }
 
 const row = (segments) => ({ wrap: 'truncate-end', segments })
-const reasonsRow = (error) =>
-  row([{ text: '  ', style: {} }, { text: error.changes.map((c) => c.why).join(' · '), style: DIM }])
-
 const KIND_LABELS = new Map(KINDS.map((k) => [k.slug, k.label]))
-const PAGE_SIZE = 3
 const MUTE_HOTKEYS = 'asdfghjkl'
 const HINT = 'ctrl+x tab'
 const ACTION_INDENT = 2
 const ACTION_GAP = 2
-
-// Today's compact form for fewer than 3 rows, or when the action row does not
-// fit: the first error with `+N more`, then its reasons (inline at one row).
-const compactRows = (errors, tag, maxRows) => {
-  const [error, ...others] = errors
-  const why = error.changes.map((c) => c.why).join(' · ')
-  const first = [{ text: '✎ ', style: ACCENT }, tag, ...sentenceSegments(error.original, error.corrected)]
-  if (others.length > 0) first.push({ text: `  +${others.length} more`, style: DIM })
-  if (maxRows < 2) return { gap: false, rows: [row(why ? [...first, { text: ` · ${why}`, style: DIM }] : first)], page: 0, pages: 1 }
-  return { gap: maxRows >= 3, rows: [row(first), reasonsRow(error)], page: 0, pages: 1 }
-}
+const TEXT_INDENT = 2
+const REASON_INDENT = 4
+const REASON_ROWS = 4
 
 // The distinct muteable kinds of these errors, in order of appearance.
 const muteableKinds = (errors) => {
@@ -337,89 +478,127 @@ const muteableKinds = (errors) => {
 }
 
 /**
- * The action row for one page: `{ actions, hint, pageText }`; `null` when it
- * has nothing to press (one page, only `other` kinds); `false` when the page
- * text with `n`/`p` does not fit `columns`. Too wide: the hint goes first,
- * then the mute buttons from the end.
+ * The action row, `{ actions, hint }`: the toggle `{ key: 'toggle', hotkey: 'm',
+ * label: 'more' | 'less' }`, then (expanded only) the mute buttons `{ key, hotkey,
+ * label, color }`, then the hint. Too wide: the hint goes first, then the mute
+ * buttons from the end; the toggle stays whenever it fits at all (else `null`).
  */
-const actionRow = (errors, page, pages, columns) => {
-  const paged = pages > 1
-  const actions = paged
-    ? [
-        { key: 'page:next', hotkey: 'n', label: 'next' },
-        { key: 'page:back', hotkey: 'p', label: 'back' },
-      ]
+const actionRow = (errors, columns, expanded) => {
+  const toggle = { key: 'toggle', hotkey: 'm', label: expanded ? 'less' : 'more' }
+  const mutes = expanded
+    ? muteableKinds(errors).map((slug, i) => ({
+        key: `mute:${slug}`,
+        hotkey: MUTE_HOTKEYS[i],
+        label: `mute ${KIND_LABELS.get(slug)}`,
+        color: groupOf(slug).color,
+      }))
     : []
-  const mutes = muteableKinds(errors).map((slug, i) => ({
-    key: `mute:${slug}`,
-    hotkey: MUTE_HOTKEYS[i],
-    label: `mute ${KIND_LABELS.get(slug)}`,
-  }))
-  if (!paged && mutes.length === 0) return null
-  const pageText = paged ? `‹ ${page + 1}/${pages} ›` : undefined
   const width = (acts, hint) =>
     ACTION_INDENT +
-    [pageText, ...acts.map((a) => `${a.hotkey}: ${a.label}`), hint]
+    [...acts.map((a) => `${a.hotkey}: ${a.label}`), hint]
       .filter(Boolean)
       .map((t) => t.length)
       .reduce((sum, w, i) => sum + w + (i > 0 ? ACTION_GAP : 0), 0)
-  let hint = HINT
   let keep = mutes.length
-  if (width([...actions, ...mutes], hint) > columns) hint = undefined
-  while (keep > 0 && width([...actions, ...mutes.slice(0, keep)], hint) > columns) keep--
-  const shown = [...actions, ...mutes.slice(0, keep)]
-  if (width(shown, hint) > columns || shown.length === 0) return false
-  return { actions: shown, hint, pageText }
+  while (keep > 0 && width([toggle, ...mutes.slice(0, keep)]) > columns) keep--
+  const actions = [toggle, ...mutes.slice(0, keep)]
+  if (width(actions) > columns) return null
+  return { actions, hint: width(actions, HINT) > columns ? undefined : HINT }
+}
+
+// One text line of tokens as segments: a space before a token joins the style
+// of the token before it when both are alike, else it is plain; equal styles merge.
+const lineSegments = (line, indent) => {
+  const segments = []
+  const push = (text, style) => {
+    const prev = segments[segments.length - 1]
+    if (prev && JSON.stringify(prev.style) === JSON.stringify(style)) prev.text += text
+    else segments.push({ text, style })
+  }
+  if (indent > 0) push(' '.repeat(indent), {})
+  line.forEach((t, i) => {
+    if (i > 0 && t.space) push(' ', JSON.stringify(line[i - 1].style) === JSON.stringify(t.style) ? t.style : {})
+    push(t.text, t.style)
+  })
+  return segments
+}
+
+// Whether a line of tokens fits in `columns` with a `…` after it (a continuation line
+// starts at REASON_INDENT).
+const fitsWithCut = (line, columns, lead) => lead + line.reduce((sum, t) => sum + t.text.length + (t.space ? 1 : 0), 0) + 1 <= columns
+
+// The reasons rows, REASON_ROWS at most. Up to REASON_ROWS groups: each gets its own
+// row first; the rows left over go to the groups in order, each taking what it needs to
+// wrap (continuation lines indented REASON_INDENT), and a group longer than its rows
+// ends in `…`. More groups: the first REASON_ROWS - 1 get one row each (cut with `…`),
+// and the rest go together on the last row, each in its own color, for truncate-end to
+// cut (built from the groups' own tokens: a wrapped line's first token has no space
+// before it).
+const reasonRows = (errors, columns) => {
+  const groups = groupReasons(errors).map(({ group, whys }) => {
+    const style = group ? { color: group.color } : DIM
+    const words = `${group ? group.label : 'other'}: ${whys.join(' · ')}`.split(' ')
+    const tokens = [{ text: '  ', space: false, style: {} }, ...words.map((text, i) => ({ text, space: i > 0, style }))]
+    return { style, tokens, lines: wrapTokens(tokens, columns, REASON_INDENT) }
+  })
+  const packed = groups.length > REASON_ROWS
+  const own = packed ? groups.slice(0, REASON_ROWS - 1) : groups
+  let spare = REASON_ROWS - own.length - (packed ? 1 : 0)
+  const rows = []
+  for (const { style, lines } of own) {
+    const extra = Math.min(spare, lines.length - 1)
+    spare -= extra
+    const shown = lines.slice(0, 1 + extra)
+    shown.forEach((line, i) => {
+      const lead = i === 0 ? 0 : REASON_INDENT
+      if (i < shown.length - 1 || shown.length === lines.length) return rows.push(row(lineSegments(line, lead)))
+      const kept = [...line]
+      while (kept.length > 1 && (kept.at(-1).text === '·' || !fitsWithCut(kept, columns, lead))) kept.pop()
+      rows.push(row(lineSegments([...kept, { text: ELLIPSIS, space: false, style }], lead)))
+    })
+  }
+  if (packed) rows.push(row(lineSegments(groups.slice(REASON_ROWS - 1).flatMap((g) => g.tokens), 0)))
+  return rows
 }
 
 /**
  * Lays out the band in the look of the built-in you-should-know band: an
- * accent glyph, a dim tag, then the text, with the reasons under a 2-space
- * indent. Text rows are styled segments `{ wrap, segments }`, each meant for
- * `wrap: 'truncate-end'`; the action row is `{ actions: [{ key, hotkey, label }],
- * hint, pageText }` (Buttons plus dim text).
- * view: `{ kind: 'ok', source }` | `{ kind: 'fix', source, errors }`
+ * accent glyph, a dim tag, then the whole draft with every fix applied, the
+ * changed words in their group's color, wrapped at `bodyColumns` (continuation
+ * lines indented 2). Minimal (the default): then the toggle row alone. `expanded`:
+ * then the reasons rows (at most REASON_ROWS: a row per error group in the
+ * group's color, `other` dim, wrapped; see `reasonRows`) and the action row, whose
+ * first button is the toggle. No toggle row when expanding would add nothing (no
+ * reasons rows, no mute buttons). Text and reasons rows are styled segments
+ * `{ wrap, segments }`, each meant for `wrap: 'truncate-end'`; the action row is
+ * `{ actions: [{ key, hotkey, label, color? }], hint }` (Buttons plus dim text).
+ * view: `{ kind: 'ok', source }` | `{ kind: 'fix', source, text, errors }`
  * (`source`: 'draft' | 'sent'). `muted` (kind slugs) is filtered out of the
- * errors; with none left the band reads "no errors". `page` is zero-based and
- * clamped. `bodyColumns` is the width for the action row (unbounded when left out).
- * Returns `{ gap, rows, page, pages }` (`page` the clamped page): `gap` asks for
- * one blank row above the rows. `rows.length + (gap ? 1 : 0)` never exceeds
- * `maxRows`. The budget drops the gap first, then the page size (3 down to 1);
- * under 3 rows, or when the action row is too wide, the compact form is used:
- * the first error with `+N more` and its reasons, with no Buttons.
+ * errors; with none left the band reads "no errors". `bodyColumns` is the width
+ * of the band (unbounded when left out).
+ * Returns `{ gap, rows }`: `gap` asks for one blank row above the rows, and is
+ * set only when the gap and every row fit in `maxRows`. A band taller than
+ * `maxRows` returns all its rows, for the engine to scroll. `maxRows <= 0`: no rows.
  */
-export const bandRows = (view, { maxRows, bodyColumns = Infinity, muted = [], page = 0 }) => {
-  if (maxRows <= 0) return { gap: false, rows: [], page: 0, pages: 1 }
+export const bandRows = (view, { maxRows, bodyColumns = Infinity, muted = [], expanded = false }) => {
+  if (maxRows <= 0) return { gap: false, rows: [] }
   const tag = { text: view.source === 'sent' ? 'English · sent · ' : 'English · ', style: DIM }
   const errors = view.kind === 'fix' ? visibleErrors(view.errors, muted) : []
   if (errors.length === 0) {
-    return {
-      gap: maxRows >= 2,
-      rows: [row([{ text: '✓ ', style: ACCENT }, tag, { text: 'no errors', style: DIM }])],
-      page: 0,
-      pages: 1,
-    }
+    return { gap: maxRows >= 2, rows: [row([{ text: '✓ ', style: ACCENT }, tag, { text: 'no errors', style: DIM }])] }
   }
-  if (maxRows < 3) return compactRows(errors, tag, maxRows)
 
-  // Rows one page of `size` errors takes, the action row included.
-  const need = (size) => {
-    const pages = Math.ceil(errors.length / size)
-    return 2 * Math.min(size, errors.length) + (pages > 1 || muteableKinds(errors).length > 0 ? 1 : 0)
+  const tokens = [
+    { text: '✎ ', space: false, style: ACCENT },
+    { ...tag, space: false },
+    ...fixedTokens(view.text, view.errors, muted).map((t, i) => (i === 0 ? { ...t, breakBefore: true } : t)),
+  ]
+  const rows = wrapTokens(tokens, bodyColumns, TEXT_INDENT).map((line, i) => row(lineSegments(line, i === 0 ? 0 : TEXT_INDENT)))
+  const reasons = reasonRows(errors, bodyColumns)
+  if (reasons.length > 0 || muteableKinds(errors).length > 0) {
+    if (expanded) rows.push(...reasons)
+    const actions = actionRow(errors, bodyColumns, expanded)
+    if (actions !== null) rows.push(actions)
   }
-  const full = Math.min(PAGE_SIZE, errors.length)
-  let size = full
-  while (size > 1 && need(size) > maxRows) size--
-  const pages = Math.ceil(errors.length / size)
-  const current = Math.min(Math.max(page, 0), pages - 1)
-  const shown = errors.slice(current * size, (current + 1) * size)
-  const actions = actionRow(shown, current, pages, bodyColumns)
-  if (actions === false) return compactRows(errors, tag, maxRows)
-
-  const rows = shown.flatMap((error, i) => [
-    row([{ text: '✎ ', style: ACCENT }, ...(i === 0 ? [tag] : []), ...sentenceSegments(error.original, error.corrected)]),
-    reasonsRow(error),
-  ])
-  if (actions !== null) rows.push(actions)
-  return { gap: size === full && need(full) + 1 <= maxRows, rows, page: current, pages }
+  return { gap: rows.length + 1 <= maxRows, rows }
 }

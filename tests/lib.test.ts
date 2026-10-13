@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { KINDS, alignWords, bandRows, diffWords, normalizeWhitespace, parseErrors, prepareDraft, systemPrompt, visibleErrors } from '../hooks/lib.js'
+import { GROUPS, KINDS, alignWords, bandRows, diffWords, fixedTokens, groupOf, groupReasons, normalizeWhitespace, parseErrors, prepareDraft, systemPrompt, visibleErrors, wrapTokens } from '../hooks/lib.js'
 
 const SENT = 'I want that you checks my text. It is fine here.'
 const fix = (extra: Record<string, unknown> = {}) =>
@@ -255,181 +255,351 @@ describe('bandRows', () => {
   type Row = {
     wrap?: string
     segments?: { text: string; style: object }[]
-    actions?: { key: string; hotkey: string; label: string }[]
+    actions?: { key: string; hotkey: string; label: string; color: string }[]
     hint?: string
-    pageText?: string
   }
   const err = (n: number, kind = 'article') => ({
     original: `Sentence ${n} here`,
     corrected: `Sentence ${n} there`,
     changes: [{ kind, why: `why ${n}` }],
   })
-  const view = (errors: ReturnType<typeof err>[], source: 'draft' | 'sent' = 'draft') => ({ kind: 'fix' as const, source, errors })
+  const view = (errors: ReturnType<typeof err>[], source: 'draft' | 'sent' = 'draft') => ({
+    kind: 'fix' as const,
+    source,
+    text: errors.map((e) => e.original).join(' '),
+    errors,
+  })
   const fixView = {
     kind: 'fix' as const,
     source: 'draft' as const,
+    text: 'I want check it',
     errors: [{ original: 'I want check it', corrected: 'I want to check it', changes: [{ kind: 'article', why: 'missing to' }] }],
   }
   const otherView = view([err(1, 'other')])
   const four = view([err(1, 'apostrophe'), err(2, 'comma'), err(3, 'apostrophe'), err(4, 'spelling')])
-  const layout = (v: Parameters<typeof bandRows>[0], opts: Parameters<typeof bandRows>[1]) => bandRows(v, opts) as unknown as { gap: boolean; rows: Row[]; page: number; pages: number }
+  // Four groups and `other`: spelling, grammar, other, punctuation.
+  const grouped = view([err(1, 'spelling'), err(2, 'verb-form'), err(3, 'other'), err(4, 'comma')])
+  // Expanded unless a test says otherwise: most tests look at the reasons rows and the mute buttons.
+  const layout = (v: Parameters<typeof bandRows>[0], opts: Parameters<typeof bandRows>[1]) => bandRows(v, { expanded: true, ...opts }) as unknown as { gap: boolean; rows: Row[] }
   const textRows = (rows: Row[]) => rows.filter((r) => r.segments)
   const text = (r: Row) => r.segments!.map((s) => s.text).join('')
   const texts = (rows: Row[]) => textRows(rows).map(text)
   const actionOf = (rows: Row[]) => rows.find((r) => r.actions)
+  const TOGGLE = { key: 'toggle', hotkey: 'm' }
+  const mutesOf = (r: Row) => r.actions!.filter((a) => a.key !== 'toggle')
   // The action row as drawn: a 2-space indent, parts 2 spaces apart.
-  const drawn = (r: Row) =>
-    '  ' + [r.pageText, ...r.actions!.map((a) => `${a.hotkey}: ${a.label}`), r.hint].filter(Boolean).join('  ')
+  const drawn = (r: Row) => '  ' + [...r.actions!.map((a) => `${a.hotkey}: ${a.label}`), r.hint].filter(Boolean).join('  ')
 
   const ACCENT = { color: 'suggestion' }
   const DIM = { dimColor: true }
 
-  test('fix: one error with a mute button takes three rows, and a gap from four', async () => {
+  test('fix: the text row, a reasons row and the action row take three rows, and a gap from four', async () => {
     const at3 = layout(fixView, { maxRows: 3 })
     expect(at3.gap).toBe(false)
     expect(at3.rows).toHaveLength(3)
-    expect(texts(at3.rows)).toEqual(['✎ English · I want to check it', '  missing to'])
+    expect(texts(at3.rows)).toEqual(['✎ English · I want to check it', '  small words: missing to'])
     expect(textRows(at3.rows)[0]!.segments!.slice(0, 2)).toEqual([
       { text: '✎ ', style: ACCENT },
       { text: 'English · ', style: DIM },
     ])
     expect(textRows(at3.rows)[1]!.segments).toEqual([
       { text: '  ', style: {} },
-      { text: 'missing to', style: DIM },
+      { text: 'small words: missing to', style: { color: 'ide' } },
     ])
     expect(actionOf(at3.rows)).toEqual({
-      actions: [{ key: 'mute:article', hotkey: 'a', label: 'mute articles' }],
+      actions: [
+        { ...TOGGLE, label: 'less' },
+        { key: 'mute:article', hotkey: 'a', label: 'mute articles', color: 'ide' },
+      ],
       hint: 'ctrl+x tab',
-      pageText: undefined,
     })
     expect(layout(fixView, { maxRows: 4 }).gap).toBe(true)
   })
 
-  test('changed words are styled, others plain', async () => {
+  test('changed words are in their group color and bold, others plain', async () => {
     const segs = textRows(layout(fixView, { maxRows: 3 }).rows)[0]!.segments!
-    expect(segs).toContainEqual({ text: ' to', style: { color: 'diffAddedWord', bold: true } })
-    expect(segs).toContainEqual({ text: 'I want', style: {} })
+    expect(segs).toContainEqual({ text: 'to', style: { color: 'ide', bold: true } })
+    expect(segs).toContainEqual({ text: 'I want ', style: {} })
     expect(segs).toContainEqual({ text: ' check it', style: {} })
   })
 
-  test('4 errors at maxRows 10: 3 errors, the action row and the page text', async () => {
-    const { gap, rows, page, pages } = layout(four, { maxRows: 10 })
-    expect(gap).toBe(true)
-    expect([page, pages]).toEqual([0, 2])
-    expect(rows).toHaveLength(7)
+  test('all errors are one text: every fix applied, in order', async () => {
+    const l = layout(four, { maxRows: 10 })
+    expect(texts(l.rows)[0]).toBe('✎ English · Sentence 1 there Sentence 2 there Sentence 3 there Sentence 4 there')
+  })
+
+  test('the text wraps at bodyColumns: the tag on line 1 only, continuation lines indented 2', async () => {
+    const l = layout(fixView, { maxRows: 10, bodyColumns: 24 })
+    expect(texts(l.rows).slice(0, 2)).toEqual(['✎ English · I want to', '  check it'])
+    expect(textRows(l.rows)[1]!.segments![0]).toEqual({ text: '  check it', style: {} })
+    const wide = layout(fixView, { maxRows: 10, bodyColumns: 30 })
+    expect(texts(wide.rows)[0]).toBe('✎ English · I want to check it')
+    const lines = texts(layout(four, { maxRows: 10, bodyColumns: 30 }).rows).slice(0, 3)
+    expect(lines).toEqual(['✎ English · Sentence 1 there', '  Sentence 2 there Sentence 3', '  there Sentence 4 there'])
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(30)
+  })
+
+  test('a long first word wraps to its own line after the tag instead of being cut', async () => {
+    const v = {
+      kind: 'fix' as const,
+      source: 'draft' as const,
+      text: 'Internationalisation is hard',
+      errors: [{ original: 'hard', corrected: 'difficult', changes: [{ kind: 'word-choice', why: 'clearer' }] }],
+    }
+    const l = layout(v, { maxRows: 10, bodyColumns: 30 })
+    expect(texts(l.rows).slice(0, 3)).toEqual(['✎ English · ', '  Internationalisation is', '  difficult'])
+    expect(layout(v, { maxRows: 10, bodyColumns: 40 }).rows.map((r) => r.segments && text(r))[0]).toBe('✎ English · Internationalisation is')
+  })
+
+  test('one reasons row per group in group order, then other, each in its color', async () => {
+    const { rows } = layout(grouped, { maxRows: 10 })
     expect(texts(rows)).toEqual([
-      '✎ English · Sentence 1 there',
-      '  why 1',
-      '✎ Sentence 2 there',
-      '  why 2',
-      '✎ Sentence 3 there',
-      '  why 3',
+      '✎ English · Sentence 1 there Sentence 2 there Sentence 3 there Sentence 4 there',
+      '  grammar: why 2',
+      '  spelling: why 1',
+      '  punctuation: why 4',
+      '  other: why 3',
     ])
-    expect(rows[6]).toEqual({
-      pageText: '‹ 1/2 ›',
-      actions: [
-        { key: 'page:next', hotkey: 'n', label: 'next' },
-        { key: 'page:back', hotkey: 'p', label: 'back' },
-        { key: 'mute:apostrophe', hotkey: 'a', label: 'mute apostrophes' },
-        { key: 'mute:comma', hotkey: 's', label: 'mute commas' },
-      ],
-      hint: 'ctrl+x tab',
+    expect(textRows(rows).slice(1).map((r) => r.segments![1]!.style)).toEqual([
+      { color: 'warning' },
+      { color: 'success' },
+      { color: 'claude' },
+      DIM,
+    ])
+  })
+
+  describe('reasons rows', () => {
+    const multi = (...changes: [string, string][]) => ({
+      kind: 'fix' as const,
+      source: 'draft' as const,
+      text: 'Hi',
+      errors: [{ original: 'Hi', corrected: 'Yo', changes: changes.map(([kind, why]) => ({ kind, why })) }],
     })
-    expect(drawn(rows[6]!)).toBe('  ‹ 1/2 ›  n: next  p: back  a: mute apostrophes  s: mute commas  ctrl+x tab')
-  })
+    const reasons = (v: Parameters<typeof bandRows>[0], bodyColumns: number) => layout(v, { maxRows: 99, bodyColumns }).rows.filter((r) => r.segments).slice(1)
+    const long = 'Base form after "to" · "before" clause needs simple present · Past tense needed with "Yesterday"'
+    const example = multi(
+      ['verb-form', 'Base form after "to"'],
+      ['verb-form', '"before" clause needs simple present'],
+      ['verb-form', 'Past tense needed with "Yesterday"'],
+      ['article', 'No article before London'],
+      ['article', 'Singular noun needs an article'],
+      ['word-choice', '"want" takes an infinitive with "to"'],
+      ['comma', 'Contraction needs an apostrophe'],
+      ['other', 'odd'],
+    )
 
-  test('the tag shows on the first error of a page only; page 2 holds the rest', async () => {
-    const { rows, page } = layout(four, { maxRows: 10, page: 1 })
-    expect(page).toBe(1)
-    expect(texts(rows)).toEqual(['✎ English · Sentence 4 there', '  why 4'])
-    expect(actionOf(rows)).toEqual({
-      pageText: '‹ 2/2 ›',
-      actions: [
-        { key: 'page:next', hotkey: 'n', label: 'next' },
-        { key: 'page:back', hotkey: 'p', label: 'back' },
-        { key: 'mute:spelling', hotkey: 'a', label: 'mute spelling' },
-      ],
-      hint: 'ctrl+x tab',
+    test('a long group wraps at the width with a 4-space continuation, in its color', async () => {
+      const rows = reasons(multi(['verb-form', long.split(' · ')[0]!], ['verb-form', long.split(' · ')[1]!], ['verb-form', long.split(' · ')[2]!]), 60)
+      expect(rows.map(text)).toEqual([
+        '  grammar: Base form after "to" · "before" clause needs',
+        '    simple present · Past tense needed with "Yesterday"',
+      ])
+      for (const r of rows) expect(r.segments!.filter((x) => x.text.trim()).every((x) => x.style.color === 'warning')).toBe(true)
+      expect(rows[1]!.segments![0]).toEqual({ text: '    ', style: {} })
+    })
+
+    test('with more than 4 groups, groups 1-3 get one row each (cut with …) and row 4 packs the rest in their own colors', async () => {
+      const rows = reasons(example, 75)
+      expect(rows.map(text)).toEqual([
+        '  grammar: Base form after "to" · "before" clause needs simple present…',
+        '  small words: No article before London · Singular noun needs an article',
+        '  wording: "want" takes an infinitive with "to"',
+        '  punctuation: Contraction needs an apostrophe  other: odd',
+      ])
+      expect(rows[3]!.wrap).toBe('truncate-end')
+      expect(rows[3]!.segments!.filter((x) => x.text.trim()).map((x) => x.style)).toEqual([{ color: 'claude' }, DIM])
+    })
+
+    test('a long second group of five does not move the packed row up: it is always row 4', async () => {
+      const v = multi(['verb-form', 'a'], ['article', long], ['word-choice', 'c'], ['comma', 'd'], ['other', 'e'])
+      const rows = reasons(v, 55)
+      expect(rows).toHaveLength(4)
+      expect(rows.map((r) => text(r).split(':')[0])).toEqual(['  grammar', '  small words', '  wording', '  punctuation'])
+      expect(text(rows[1]!).endsWith('…')).toBe(true)
+      expect(text(rows[3]!)).toBe('  punctuation: d  other: e')
+    })
+
+    test('with 5 groups and a long first group, groups 2 and 3 are still visible', async () => {
+      const v = multi(['verb-form', long], ['article', 'No article'], ['word-choice', 'want + to'], ['comma', 'apostrophe'], ['other', 'odd'])
+      const rows = reasons(v, 55)
+      expect(rows.map(text)).toEqual([
+        '  grammar: Base form after "to" · "before" clause…',
+        '  small words: No article',
+        '  wording: want + to',
+        '  punctuation: apostrophe  other: odd',
+      ])
+    })
+
+    test('with 3 groups and a long first group, every group has its row and the spare row wraps the first', async () => {
+      const v = multi(['verb-form', long], ['verb-form', 'A fourth reason that runs on'], ['article', 'No article'], ['word-choice', 'want + to'])
+      const rows = reasons(v, 55)
+      expect(rows.map(text)).toEqual([
+        '  grammar: Base form after "to" · "before" clause needs',
+        '    simple present · Past tense needed with…',
+        '  small words: No article',
+        '  wording: want + to',
+      ])
+      expect(rows[1]!.segments![0]).toEqual({ text: '    ', style: {} })
+    })
+
+    test('with up to 4 groups, every group is visible in its own row whatever the width', async () => {
+      const four = multi(['verb-form', long], ['article', long], ['word-choice', long], ['comma', long])
+      for (const w of [20, 30, 55, 120]) {
+        expect(reasons(four, w).map((r) => text(r).trim().split(':')[0])).toEqual(['grammar', 'small words', 'wording', 'punctuation'])
+      }
+      const two = multi(['verb-form', long], ['article', long])
+      const rows = reasons(two, 40)
+      expect(rows).toHaveLength(4)
+      expect(rows.map((r) => text(r).trim().split(':')[0]).filter((t) => t === 'grammar' || t === 'small words')).toEqual(['grammar', 'small words'])
+    })
+
+    test('spare rows go to long groups in order: the first takes what it needs, the next what is left', async () => {
+      const two = multi(['verb-form', long], ['article', long])
+      const rows = reasons(two, 60)
+      // 'grammar' wraps to 2 lines, 'small words' to 2: both fit in 4 rows.
+      expect(rows.map(text)).toEqual([
+        '  grammar: Base form after "to" · "before" clause needs',
+        '    simple present · Past tense needed with "Yesterday"',
+        '  small words: Base form after "to" · "before" clause needs',
+        '    simple present · Past tense needed with "Yesterday"',
+      ])
+    })
+
+    test('a group that wrapped keeps its single spaces when it is packed onto the last row', async () => {
+      const v = multi(
+        ['verb-form', 'a'],
+        ['article', 'b'],
+        ['word-choice', 'c'],
+        ['spelling', '"want" takes an infinitive with "to" and a few more words here and there ok'],
+        ['comma', 'Contraction needs an apostrophe'],
+        ['other', 'odd'],
+      )
+      const rows = reasons(v, 40)
+      expect(rows.map(text)).toEqual([
+        '  grammar: a',
+        '  small words: b',
+        '  wording: c',
+        '  spelling: "want" takes an infinitive with "to" and a few more words here and there ok  punctuation: Contraction needs an apostrophe  other: odd',
+      ])
+    })
+
+    test('one group longer than 4 rows stops at row 4, cut with an ellipsis', async () => {
+      const whys = Array.from({ length: 12 }, (_, i) => ['verb-form', `reason number ${i + 1}`] as [string, string])
+      const rows = reasons(multi(...whys), 40)
+      expect(rows).toHaveLength(4)
+      expect(text(rows[3]!).endsWith('…')).toBe(true)
+      expect(text(rows[0]!).startsWith('  grammar: reason number 1')).toBe(true)
+    })
+
+    test('other stays last and dim; unbounded width gives one row per group', async () => {
+      const four = multi(['verb-form', long], ['article', long], ['word-choice', long], ['other', long])
+      const rows = reasons(four, Infinity)
+      expect(rows.map(text).map((t) => t.split(':')[0])).toEqual(['  grammar', '  small words', '  wording', '  other'])
+      expect(rows.at(-1)!.segments![1]!.style).toEqual(DIM)
+      const packed = reasons(example, 40)
+      expect(packed.at(-1)!.segments!.at(-1)!.style).toEqual(DIM)
+      expect(text(packed.at(-1)!).endsWith('other: odd')).toBe(true)
+    })
+
+    test('the reasons never take more than 4 rows', async () => {
+      const mixes = [
+        example,
+        multi(['verb-form', long], ['article', long], ['comma', long], ['spelling', long], ['other', long]),
+        multi(['verb-form', 'a'], ['article', 'b'], ['comma', 'c'], ['spelling', 'd'], ['word-choice', 'e'], ['other', 'f']),
+        multi(['spelling', long + ' ' + long + ' ' + long]),
+      ]
+      for (const v of mixes) {
+        for (const w of [10, 20, 30, 45, 60, 75, 120, Infinity]) {
+          const n = reasons(v, w).length
+          expect(n).toBeGreaterThan(0)
+          expect(n).toBeLessThanOrEqual(4)
+        }
+      }
     })
   })
 
-  test('the page is clamped', async () => {
-    expect(layout(four, { maxRows: 10, page: 7 }).page).toBe(1)
-    expect(layout(four, { maxRows: 10, page: -2 }).page).toBe(0)
+  test('each mute button carries the color of its group', async () => {
+    const actions = mutesOf(actionOf(layout(grouped, { maxRows: 10 }).rows)!)
+    expect(actions.map((a) => [a.key, a.color])).toEqual([
+      ['mute:spelling', 'success'],
+      ['mute:verb-form', 'warning'],
+      ['mute:comma', 'claude'],
+    ])
   })
 
-  test('no action row for one page of other kinds; one page with a kind has no page text or n/p', async () => {
+  test('a repeated reason is listed once, and a group joins its reasons', async () => {
+    const v = view([{ ...err(1), changes: [{ kind: 'article', why: 'a1' }, { kind: 'preposition', why: 'a2' }, { kind: 'article', why: 'a1' }, { kind: 'spelling', why: 'typo' }] }])
+    expect(texts(layout(v, { maxRows: 10 }).rows).slice(1)).toEqual(['  small words: a1 · a2', '  spelling: typo'])
+    expect(texts(layout(v, { maxRows: 10, muted: ['spelling'] }).rows).slice(1)).toEqual(['  small words: a1 · a2'])
+  })
+
+  test('only other kinds: the action row is the toggle and the hint, no mute button', async () => {
     const other = layout(otherView, { maxRows: 10 })
-    expect(other.rows).toHaveLength(2)
-    expect(actionOf(other.rows)).toBeUndefined()
+    expect(texts(other.rows)).toEqual(['✎ English · Sentence 1 there', '  other: why 1'])
+    expect(other.rows).toHaveLength(3)
+    expect(actionOf(other.rows)).toEqual({ actions: [{ ...TOGGLE, label: 'less' }], hint: 'ctrl+x tab' })
+    expect(textRows(other.rows)[1]!.segments![1]).toEqual({ text: 'other: why 1', style: DIM })
     const single = actionOf(layout(view([err(1), err(2, 'comma')]), { maxRows: 10 }).rows)!
-    expect(single.pageText).toBeUndefined()
-    expect(single.actions.map((a) => a.key)).toEqual(['mute:article', 'mute:comma'])
+    expect(single.actions!.map((a) => a.key)).toEqual(['toggle', 'mute:article', 'mute:comma'])
   })
 
-  test('other kinds get no mute button but the page buttons stay', async () => {
+  test('other and unknown kinds get no mute button', async () => {
     const v = view([err(1, 'other'), err(2, 'other'), err(3, 'other'), err(4, 'other')])
-    expect(actionOf(layout(v, { maxRows: 10 }).rows)!.actions.map((a) => a.key)).toEqual(['page:next', 'page:back'])
+    expect(mutesOf(actionOf(layout(v, { maxRows: 10 }).rows)!)).toEqual([])
     const mixed = view([err(1, 'tense-soup'), err(2, 'comma')])
-    expect(actionOf(layout(mixed, { maxRows: 10 }).rows)!.actions.map((a) => a.key)).toEqual(['mute:comma'])
+    expect(mutesOf(actionOf(layout(mixed, { maxRows: 10 }).rows)!).map((a) => a.key)).toEqual(['mute:comma'])
   })
 
   test('at most 9 mute buttons, hotkeys a s d f g h j k l, letters only', async () => {
     const slugs = ['article', 'preposition', 'verb-form', 'agreement', 'word-order', 'word-choice', 'number', 'pronoun', 'apostrophe', 'comma', 'spelling', 'capitalization']
     const many = view([0, 1, 2].map((i) => ({ ...err(i), changes: slugs.slice(i * 4, i * 4 + 4).map((kind) => ({ kind, why: 'x' })) })))
     const wide = actionOf(layout(many, { maxRows: 10 }).rows)!
-    expect(wide.actions.map((a) => a.hotkey).join('')).toBe('asdfghjkl')
-    expect(wide.actions).toHaveLength(9)
+    expect(mutesOf(wide).map((a) => a.hotkey).join('')).toBe('asdfghjkl')
+    expect(mutesOf(wide)).toHaveLength(9)
     const hotkeys = [four, view([err(1), err(2, 'comma')]), fixView]
       .flatMap((x) => [3, 5, 7, 10].flatMap((maxRows) => layout(x, { maxRows }).rows))
       .flatMap((r) => r.actions?.map((a) => a.hotkey) ?? [])
     expect(hotkeys.length).toBeGreaterThan(0)
-    for (const h of [...hotkeys, ...wide.actions.map((a) => a.hotkey)]) expect(h).toMatch(/^[a-z]$/)
+    for (const h of [...hotkeys, ...wide.actions!.map((a) => a.hotkey)]) expect(h).toMatch(/^[a-z]$/)
   })
 
-  test('the budget drops the gap, then the page size from 3 to 1', async () => {
-    const at = (maxRows: number) => {
-      const l = layout(four, { maxRows })
-      return [l.gap, textRows(l.rows).length / 2, l.pages]
-    }
-    expect(at(8)).toEqual([true, 3, 2])
-    expect(at(7)).toEqual([false, 3, 2])
-    expect(at(6)).toEqual([false, 2, 2])
-    expect(at(5)).toEqual([false, 2, 2])
-    expect(at(4)).toEqual([false, 1, 4])
-    expect(at(3)).toEqual([false, 1, 4])
+  test('a band taller than maxRows returns all its rows, with no gap', async () => {
+    const l = layout(grouped, { maxRows: 2 })
+    expect(l.gap).toBe(false)
+    expect(l.rows).toHaveLength(6)
+    expect(layout(grouped, { maxRows: 1 }).rows).toHaveLength(6)
   })
 
-  test('maxRows 2 and 1 keep the compact forms with no action row', async () => {
-    const two = layout(four, { maxRows: 2 })
-    expect(two.gap).toBe(false)
-    expect(texts(two.rows)).toEqual(['✎ English · Sentence 1 there  +3 more', '  why 1'])
-    expect(two.rows.some((r) => r.actions)).toBe(false)
-    const one = layout(four, { maxRows: 1 })
-    expect(one.gap).toBe(false)
-    expect(texts(one.rows)).toEqual(['✎ English · Sentence 1 there  +3 more · why 1'])
-    expect(textRows(two.rows)[0]!.segments!.at(-1)).toEqual({ text: '  +3 more', style: DIM })
-    expect(texts(layout(fixView, { maxRows: 1 }).rows)).toEqual(['✎ English · I want to check it · missing to'])
+  test('the gap shows only when every row fits', async () => {
+    const at = (maxRows: number) => layout(grouped, { maxRows }).gap
+    expect([5, 6, 7].map(at)).toEqual([false, false, true])
   })
 
-  test('a muted kind is drawn out; the compact count follows the visible errors', async () => {
+  test('a muted kind is drawn out of the text, the reasons and the buttons', async () => {
     const l = layout(four, { maxRows: 10, muted: ['apostrophe'] })
-    expect(texts(l.rows)).toEqual(['✎ English · Sentence 2 there', '  why 2', '✎ Sentence 4 there', '  why 4'])
-    expect(actionOf(l.rows)!.actions.map((a) => a.key)).toEqual(['mute:comma', 'mute:spelling'])
-    expect(actionOf(l.rows)!.pageText).toBeUndefined()
-    expect(texts(layout(four, { maxRows: 2, muted: ['apostrophe'] }).rows)[0]).toBe('✎ English · Sentence 2 there  +1 more')
+    expect(texts(l.rows)).toEqual([
+      '✎ English · Sentence 1 here Sentence 2 there Sentence 3 here Sentence 4 there',
+      '  spelling: why 4',
+      '  punctuation: why 2',
+    ])
+    expect(mutesOf(actionOf(l.rows)!).map((a) => a.key)).toEqual(['mute:comma', 'mute:spelling'])
   })
 
   test('muted apostrophes: an apostrophe-only edit labelled spelling draws no highlight', async () => {
-    const v = view([
-      { original: 'i dont know thing', corrected: "i don't know the thing", changes: [{ kind: 'spelling', why: 'a' }, { kind: 'article', why: 'b' }] },
-      { original: 'Its fine', corrected: "It's fine", changes: [{ kind: 'word-choice', why: 'c' }] },
-    ])
+    const v = {
+      kind: 'fix' as const,
+      source: 'draft' as const,
+      text: 'i dont know thing. Its fine',
+      errors: [
+        { original: 'i dont know thing', corrected: "i don't know the thing", changes: [{ kind: 'spelling', why: 'a' }, { kind: 'article', why: 'b' }] },
+        { original: 'Its fine', corrected: "It's fine", changes: [{ kind: 'word-choice', why: 'c' }] },
+      ],
+    }
     const l = layout(v, { maxRows: 10, muted: ['apostrophe'] })
-    expect(texts(l.rows)).toEqual(['✎ English · i dont know the thing', '  a · b'])
+    expect(texts(l.rows)).toEqual(['✎ English · i dont know the thing. Its fine', '  small words: b', '  spelling: a'])
     const marked = textRows(l.rows)[0]!.segments!.filter((s) => (s.style as { bold?: boolean }).bold).map((s) => s.text)
-    expect(marked).toEqual([' the'])
-    expect(texts(layout(v, { maxRows: 10 }).rows)).toHaveLength(4)
+    expect(marked).toEqual(['the'])
+    expect(texts(layout(v, { maxRows: 10 }).rows)[0]).toBe("✎ English · i don't know the thing. It's fine")
   })
 
   test('a muted other is never filtered', async () => {
@@ -440,33 +610,148 @@ describe('bandRows', () => {
     const l = layout(four, { maxRows: 10, muted: ['apostrophe', 'comma', 'spelling'] })
     expect(l.gap).toBe(true)
     expect(texts(l.rows)).toEqual(['✓ English · no errors'])
-    expect(l.pages).toBe(1)
     expect(texts(layout(view(four.errors, 'sent'), { maxRows: 1, muted: ['apostrophe', 'comma', 'spelling'] }).rows)).toEqual(['✓ English · sent · no errors'])
   })
 
-  test('a narrow action row drops the hint, then mute buttons from the end', async () => {
+  test('a narrow action row drops the hint first, then mute buttons from the end; the toggle stays while it fits', async () => {
     const full = actionOf(layout(four, { maxRows: 10 }).rows)!
-    const width = (r: Row) => drawn(r).length
-    const at = (bodyColumns: number) => actionOf(layout(four, { maxRows: 10, bodyColumns }).rows)!
-    expect(at(width(full)).hint).toBe('ctrl+x tab')
-    const noHint = at(width(full) - 1)
-    expect(noHint.hint).toBeUndefined()
-    expect(noHint.actions.map((a) => a.key)).toEqual(['page:next', 'page:back', 'mute:apostrophe', 'mute:comma'])
-    const oneMute = at(width(noHint) - 1)
-    expect(oneMute.actions.map((a) => a.key)).toEqual(['page:next', 'page:back', 'mute:apostrophe'])
-    const navOnly = at(width(oneMute) - 1)
-    expect(navOnly.actions.map((a) => a.key)).toEqual(['page:next', 'page:back'])
-    expect(drawn(navOnly)).toBe('  ‹ 1/2 ›  n: next  p: back')
+    const at = (bodyColumns: number) => actionOf(layout(four, { maxRows: 10, bodyColumns }).rows)
+    const keys = (r: Row | undefined) => r?.actions!.map((a) => a.key)
+    expect(drawn(full)).toBe('  m: less  a: mute apostrophes  s: mute commas  d: mute spelling  ctrl+x tab')
+    expect(at(76)!.hint).toBe('ctrl+x tab')
+    // All three buttons fit without the hint (64), not with it (76).
+    expect(keys(at(75))).toEqual(['toggle', 'mute:apostrophe', 'mute:comma', 'mute:spelling'])
+    expect(at(75)!.hint).toBeUndefined()
+    expect(at(64)!.hint).toBeUndefined()
+    // Two buttons and the hint fit (58): the hint stays, the third button goes.
+    expect(keys(at(63))).toEqual(['toggle', 'mute:apostrophe', 'mute:comma'])
+    expect(at(63)!.hint).toBe('ctrl+x tab')
+    expect(at(58)!.hint).toBe('ctrl+x tab')
+    // Two buttons alone fit (46), with the hint they do not.
+    expect(keys(at(57))).toEqual(['toggle', 'mute:apostrophe', 'mute:comma'])
+    expect(at(57)!.hint).toBeUndefined()
+    expect(at(46)!.hint).toBeUndefined()
+    // One button and the hint fit (42).
+    expect(keys(at(45))).toEqual(['toggle', 'mute:apostrophe'])
+    expect(at(45)!.hint).toBe('ctrl+x tab')
+    expect(at(42)!.hint).toBe('ctrl+x tab')
+    expect(keys(at(41))).toEqual(['toggle', 'mute:apostrophe'])
+    expect(at(41)!.hint).toBeUndefined()
+    expect(at(30)!.hint).toBeUndefined()
+    // The toggle and the hint fit (21); the toggle alone (9).
+    expect(keys(at(29))).toEqual(['toggle'])
+    expect(at(29)!.hint).toBe('ctrl+x tab')
+    expect(at(21)!.hint).toBe('ctrl+x tab')
+    expect(at(20)!.hint).toBeUndefined()
+    expect(keys(at(9))).toEqual(['toggle'])
+    expect(at(8)).toBeUndefined()
   })
 
-  test('when the page text with n/p does not fit, the compact form is used', async () => {
-    const tooNarrow = '  ‹ 1/2 ›  n: next  p: back'.length - 1
-    const l = layout(four, { maxRows: 10, bodyColumns: tooNarrow })
-    expect(texts(l.rows)).toEqual(['✎ English · Sentence 1 there  +3 more', '  why 1'])
-    expect(l.rows.some((r) => r.actions)).toBe(false)
-    expect(l.gap).toBe(true)
-    // One page and no room for even one mute button: compact too.
-    expect(layout(fixView, { maxRows: 10, bodyColumns: 10 }).rows.some((r) => r.actions)).toBe(false)
+  test('at 55 columns the toggle and two buttons fit, the hint does not', async () => {
+    // The real session: bodyColumns 55 (a 60-column pane less the engine's 5), three or more mute kinds.
+    const kinds = view([err(1, 'verb-form'), err(2, 'article'), err(3, 'spelling'), err(4, 'comma')])
+    const row = actionOf(layout(kinds, { maxRows: 10, bodyColumns: 55 }).rows)!
+    expect(row.actions!.map((a) => a.key)).toEqual(['toggle', 'mute:verb-form', 'mute:article'])
+    expect(drawn(row)).toBe('  m: less  a: mute verb forms  s: mute articles')
+    expect(drawn(row).length).toBeLessThanOrEqual(55)
+    const minimal = actionOf(layout(kinds, { maxRows: 10, bodyColumns: 55, expanded: false }).rows)!
+    expect(drawn(minimal)).toBe('  m: more  ctrl+x tab')
+  })
+
+  test('with no room for even one mute button the toggle row has the toggle alone', async () => {
+    const rows = layout(fixView, { maxRows: 10, bodyColumns: 10 }).rows
+    expect(rows.filter((r) => r.actions)).toEqual([{ actions: [{ ...TOGGLE, label: 'less' }], hint: undefined }])
+    expect(texts(rows).at(-1)).toBe('    missing to')
+  })
+
+  describe('minimal mode', () => {
+    const minimal = (v: Parameters<typeof bandRows>[0], opts: Parameters<typeof bandRows>[1] = { maxRows: 10 }) => layout(v, { ...opts, expanded: false })
+
+    test('is the default: the fixed text, then the toggle row with `more` and the hint', async () => {
+      const l = bandRows(fixView, { maxRows: 10 }) as unknown as { gap: boolean; rows: Row[] }
+      expect(texts(l.rows)).toEqual(['✎ English · I want to check it'])
+      expect(l.rows).toHaveLength(2)
+      expect(actionOf(l.rows)).toEqual({ actions: [{ ...TOGGLE, label: 'more' }], hint: 'ctrl+x tab' })
+      expect(drawn(actionOf(l.rows)!)).toBe('  m: more  ctrl+x tab')
+      expect(l).toEqual(minimal(fixView))
+    })
+
+    test('has no reasons rows and no mute button, whatever the view', async () => {
+      for (const v of [fixView, otherView, four, grouped]) {
+        const l = minimal(v)
+        expect(textRows(l.rows)).toHaveLength(1)
+        expect(l.rows).toHaveLength(2)
+        expect(l.rows.at(-1)!.actions!.map((a) => a.key)).toEqual(['toggle'])
+        expect(JSON.stringify(l)).not.toContain('mute:')
+      }
+    })
+
+    test('wrapped text rows come before the toggle row', async () => {
+      const l = minimal(fixView, { maxRows: 10, bodyColumns: 24 })
+      expect(texts(l.rows)).toEqual(['✎ English · I want to', '  check it'])
+      expect(l.rows).toHaveLength(3)
+      expect(l.rows[2]!.actions).toBeDefined()
+    })
+
+    test('a narrow toggle row drops the hint, then the row', async () => {
+      const at = (bodyColumns: number) => actionOf(minimal(fixView, { maxRows: 10, bodyColumns }).rows)
+      expect(at(21)!.hint).toBe('ctrl+x tab')
+      expect(at(20)!.hint).toBeUndefined()
+      expect(at(20)!.actions!.map((a) => a.key)).toEqual(['toggle'])
+      expect(at(9)).toBeDefined()
+      expect(at(8)).toBeUndefined()
+    })
+
+    test('no toggle row when expanding would add nothing: no reasons and no mute button', async () => {
+      // An apostrophe-only edit labelled spelling is reverted when apostrophes are muted: no change is left to explain.
+      const reverted = {
+        kind: 'fix' as const,
+        source: 'draft' as const,
+        text: 'i dont know thing',
+        errors: [{ original: 'i dont know thing', corrected: "i don't know the thing", changes: [{ kind: 'spelling', why: 'Use apostrophe in contraction' }] }],
+      }
+      for (const expanded of [false, true]) {
+        const l = layout(reverted, { maxRows: 10, muted: ['apostrophe'], expanded })
+        expect(texts(l.rows)).toEqual(['✎ English · i dont know the thing'])
+        expect(l.rows).toHaveLength(1)
+      }
+      expect(layout(reverted, { maxRows: 10, expanded: false }).rows).toHaveLength(2)
+    })
+
+    test('the gap is computed on the rows drawn', async () => {
+      // Text row + toggle row = 2 rows: the gap from 3 rows.
+      expect([1, 2, 3].map((maxRows) => minimal(fixView, { maxRows }).gap)).toEqual([false, false, true])
+      expect(layout(fixView, { maxRows: 3 }).gap).toBe(false)
+      expect([1, 2, 3].map((maxRows) => minimal(fixView, { maxRows }).rows.length)).toEqual([2, 2, 2])
+    })
+
+    test('ok and all-muted views do not change', async () => {
+      const ok = { kind: 'ok' as const, source: 'draft' as const }
+      expect(minimal(ok, { maxRows: 5 })).toEqual(layout(ok, { maxRows: 5, expanded: true }))
+      expect(texts(minimal(ok).rows)).toEqual(['✓ English · no errors'])
+      const muted = ['apostrophe', 'comma', 'spelling']
+      expect(minimal(four, { maxRows: 10, muted })).toEqual(layout(four, { maxRows: 10, muted }))
+      expect(texts(minimal(four, { maxRows: 10, muted }).rows)).toEqual(['✓ English · no errors'])
+    })
+  })
+
+  describe('expanded mode', () => {
+    test('is text rows, reasons rows, then the action row with `less` first, the mute buttons, the hint', async () => {
+      const l = layout(four, { maxRows: 10, bodyColumns: Infinity })
+      expect(texts(l.rows)).toEqual([
+        '✎ English · Sentence 1 there Sentence 2 there Sentence 3 there Sentence 4 there',
+        '  spelling: why 4',
+        '  punctuation: why 1 · why 2 · why 3',
+      ])
+      expect(l.rows.at(-1)!.actions!.map((a) => [a.key, a.hotkey, a.label])).toEqual([
+        ['toggle', 'm', 'less'],
+        ['mute:apostrophe', 'a', 'mute apostrophes'],
+        ['mute:comma', 's', 'mute commas'],
+        ['mute:spelling', 'd', 'mute spelling'],
+      ])
+      expect(l.rows.at(-1)!.actions![0]).not.toHaveProperty('color')
+      expect(l.rows.at(-1)!.hint).toBe('ctrl+x tab')
+    })
   })
 
   test('sent tag only for source sent', async () => {
@@ -474,12 +759,6 @@ describe('bandRows', () => {
     const { rows } = layout({ ...fixView, source: 'sent' }, { maxRows: 3 })
     expect(text(textRows(rows)[0]!)).toBe('✎ English · sent · I want to check it')
     expect(textRows(rows)[0]!.segments![1]).toEqual({ text: 'English · sent · ', style: DIM })
-  })
-
-  test('the reasons row joins the changes of an error', async () => {
-    const v = view([{ ...err(1), changes: [{ kind: 'article', why: 'missing to' }, { kind: 'spelling', why: 'typo' }] }])
-    expect(texts(layout(v, { maxRows: 5 }).rows)[1]).toBe('  missing to · typo')
-    expect(texts(layout(v, { maxRows: 5, muted: ['spelling'] }).rows)[1]).toBe('  missing to')
   })
 
   test('ok rows', async () => {
@@ -510,6 +789,7 @@ describe('bandRows', () => {
     fixView,
     otherView,
     four,
+    grouped,
     { ...four, source: 'sent' as const },
     view([err(1), err(2, 'comma')]),
     view(Array.from({ length: 8 }, (_, i) => err(i, i % 2 ? 'other' : 'comma'))),
@@ -517,12 +797,13 @@ describe('bandRows', () => {
     { kind: 'ok' as const, source: 'sent' as const },
   ]
 
-  test('rows plus gap never exceed maxRows, the action row included', async () => {
+  test('the gap is set only when it and every row fit in maxRows', async () => {
     for (const v of allViews) {
       for (const maxRows of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
-        for (const opts of [{}, { muted: ['comma'] }, { page: 1 }, { page: 9, bodyColumns: 30 }, { bodyColumns: 12 }]) {
+        for (const opts of [{}, { muted: ['comma'] }, { bodyColumns: 30 }, { bodyColumns: 12 }]) {
           const { gap, rows } = layout(v, { maxRows, ...opts })
-          expect(rows.length + (gap ? 1 : 0)).toBeLessThanOrEqual(maxRows)
+          expect(rows.length).toBeGreaterThan(0)
+          if (gap) expect(rows.length + 1).toBeLessThanOrEqual(maxRows)
         }
       }
     }
@@ -533,6 +814,14 @@ describe('bandRows', () => {
       for (const maxRows of [1, 2, 3, 6, 10]) {
         for (const r of textRows(layout(v, { maxRows }).rows)) expect(r.wrap).toBe('truncate-end')
       }
+    }
+  })
+
+  test('no page key, text or count anywhere', async () => {
+    for (const v of allViews) {
+      const l = layout(v, { maxRows: 10 })
+      expect(Object.keys(l).sort()).toEqual(['gap', 'rows'])
+      expect(JSON.stringify(l)).not.toMatch(/page|‹/)
     }
   })
 })
@@ -762,7 +1051,7 @@ describe('visibleErrors', () => {
       expect(visibleErrors([byWord], muted)[0].changes).toEqual([change('article', 'Add the')])
       const byForm = { ...mixedErr, changes: [change('spelling', "Write Don't"), change('article', 'Add the')] }
       expect(visibleErrors([byForm], muted)[0].changes).toEqual([change('article', 'Add the')])
-      const rows = bandRows({ kind: 'fix', source: 'draft', errors: [mixedErr] }, { maxRows: 6, muted })
+      const rows = bandRows({ kind: 'fix', source: 'draft', text: mixedErr.original, errors: [mixedErr] }, { maxRows: 6, muted })
       expect(JSON.stringify(rows)).not.toContain('mute spelling')
       expect(JSON.stringify(rows)).not.toContain('apostrophe')
     })
@@ -800,7 +1089,7 @@ describe('visibleErrors', () => {
 describe('systemPrompt', () => {
   test('names the reply shapes, kinds and carried-over rules', async () => {
     const prompt = systemPrompt([])
-    for (const s of ['{"ok":true}', '{"skip":true}', '"errors"', '"changes"', '"kind"', '"why"', '40 words', 'not English', 'in the order', 'at most 8']) {
+    for (const s of ['{"ok":true}', '{"skip":true}', '"errors"', '"changes"', '"kind"', '"words"', '"why"', '40 words', 'not English', 'in the order', 'at most 8']) {
       expect(prompt).toContain(s)
     }
     for (const { slug } of KINDS) expect(prompt).toContain(slug)
@@ -830,5 +1119,325 @@ describe('systemPrompt', () => {
 
   test('an unknown muted slug adds no line', async () => {
     expect(systemPrompt(['nope'])).not.toContain('Do not report')
+  })
+})
+
+describe('parseErrors words', () => {
+  const reply = (changes: unknown[]) =>
+    JSON.stringify({ errors: [{ original: 'I want that you checks my text.', corrected: 'I want you to check my text.', changes }] })
+  const changesOf = (changes: unknown[]) => (parseErrors(reply(changes), SENT) as { errors: { changes: unknown[] }[] }).errors[0].changes
+
+  test('a words string is kept, whitespace normalized', async () => {
+    expect(changesOf([{ kind: 'verb-form', why: 'x', words: '  you  to\ncheck ' }])).toEqual([{ kind: 'verb-form', why: 'x', words: 'you to check' }])
+  })
+
+  test('missing, empty, blank and non-string words leave no property', async () => {
+    for (const words of [undefined, '', '   ', 3, null, ['a'], { a: 1 }]) {
+      const [change] = changesOf([{ kind: 'verb-form', why: 'x', words }]) as Record<string, unknown>[]
+      expect(change).toEqual({ kind: 'verb-form', why: 'x' })
+      expect('words' in change).toBe(false)
+    }
+  })
+})
+
+describe('GROUPS and groupOf', () => {
+  test('five groups in order, with theme-key colors', async () => {
+    expect(GROUPS.map((g) => g.label)).toEqual(['grammar', 'small words', 'wording', 'spelling', 'punctuation'])
+    expect(GROUPS.map((g) => g.color)).toEqual(['warning', 'ide', 'autoAccept', 'success', 'claude'])
+    expect(GROUPS.map((g) => g.kinds)).toEqual([
+      ['verb-form', 'agreement', 'number', 'pronoun'],
+      ['article', 'preposition'],
+      ['word-choice', 'word-order'],
+      ['spelling', 'capitalization'],
+      ['apostrophe', 'comma'],
+    ])
+  })
+
+  test('every kind is in exactly one group', async () => {
+    for (const { slug } of KINDS) expect(GROUPS.filter((g) => g.kinds.includes(slug))).toHaveLength(1)
+  })
+
+  test('groupOf finds the group, or null', async () => {
+    expect(groupOf('article')).toBe(GROUPS[1])
+    expect(groupOf('comma')).toBe(GROUPS[4])
+    expect(groupOf('other')).toBeNull()
+    expect(groupOf('nope')).toBeNull()
+  })
+})
+
+describe('fixedTokens', () => {
+  const change = (kind: string, words?: string, why = 'w') => ({ kind, why, ...(words === undefined ? {} : { words }) })
+  const err = (original: string, corrected: string, changes: ReturnType<typeof change>[]) => ({ original, corrected, changes })
+  const WARN = { color: 'warning', bold: true }
+  const SMALL = { color: 'ide', bold: true }
+  const NEUTRAL = { bold: true }
+  const DIMMED = { dimColor: true }
+  const join = (tokens: { text: string; space: boolean }[]) => tokens.map((t, i) => (t.space && i > 0 ? ' ' : '') + t.text).join('')
+  const styleOf = (tokens: { text: string; style: object }[], word: string) => tokens.find((t) => t.text === word)?.style
+
+  test('a fix replaces its original; tokens carry space and plain style', async () => {
+    const tokens = fixedTokens('I want that you checks my text', [err('want that you checks', 'want you to check', [change('verb-form', 'you to check')])], [])
+    expect(join(tokens)).toBe('I want you to check my text')
+    expect(tokens[0]).toEqual({ text: 'I', space: false, style: {} })
+    expect(tokens.map((t) => t.space)).toEqual([false, true, true, true, true, true, true])
+    expect(tokens.map((t) => t.style)).toEqual([{}, {}, {}, WARN, WARN, {}, {}])
+  })
+
+  test('two errors are placed in order, in their own places', async () => {
+    const text = 'He go home. She like tea.'
+    const tokens = fixedTokens(text, [err('He go home.', 'He goes home.', [change('verb-form', 'goes')]), err('She like tea.', 'She likes tea.', [change('verb-form', 'likes')])], [])
+    expect(join(tokens)).toBe('He goes home. She likes tea.')
+    expect(tokens.filter((t) => t.style !== undefined && Object.keys(t.style).length > 0).map((t) => t.text)).toEqual(['goes', 'likes'])
+  })
+
+  test('an error placed after the cursor: a repeat of the first text matches the later occurrence', async () => {
+    const text = 'a b c d. a b c d.'
+    const tokens = fixedTokens(text, [err('a b c d.', 'a b c e.', [change('word-choice', 'e.')]), err('a b c d.', 'a b c f.', [change('word-choice', 'f.')])], [])
+    expect(join(tokens)).toBe('a b c e. a b c f.')
+  })
+
+  test('an error that is not found after the cursor changes no text', async () => {
+    const text = 'Second one here. First one here.'
+    const tokens = fixedTokens(
+      text,
+      [err('First one here.', 'First one there.', [change('word-choice', 'there.')]), err('Second one here.', 'Second one there.', [change('word-choice', 'there.')])],
+      [],
+    )
+    expect(join(tokens)).toBe('Second one here. First one there.')
+  })
+
+  test('an original inside a longer word is not a match', async () => {
+    const tokens = fixedTokens('xthe cat sat. the cat sat.', [err('the cat', 'a cat', [change('article', 'a')])], [])
+    expect(join(tokens)).toBe('xthe cat sat. a cat sat.')
+  })
+
+  test('a quote ending before a comma keeps the comma attached', async () => {
+    const tokens = fixedTokens('Please check my texts, and tell me.', [err('check my texts', 'check my text', [change('number', 'text')])], [])
+    expect(join(tokens)).toBe('Please check my text, and tell me.')
+    expect(tokens.map((t) => [t.text, t.space]).filter(([t]) => t === 'text' || t === ',')).toEqual([['text', true], [',', false]])
+  })
+
+  test('a quote inside parentheses keeps the parenthesis attached', async () => {
+    const tokens = fixedTokens('Note (I has a dog) here.', [err('I has', 'I have', [change('agreement', 'have')])], [])
+    expect(join(tokens)).toBe('Note (I have a dog) here.')
+    expect(tokens.slice(1, 3).map((t) => [t.text, t.space])).toEqual([['(', true], ['I', false]])
+  })
+
+  test('the changed word is matched by words, ignoring punctuation and case', async () => {
+    const e = err('He go home, now', 'He Goes home, now', [change('verb-form', 'goes.'), change('comma', ',')])
+    const tokens = fixedTokens('He go home, now', [e], [])
+    expect(styleOf(tokens, 'Goes')).toEqual(WARN)
+  })
+
+  test('each changed word takes the group of its own change', async () => {
+    const e = err('I has a apple', 'I have an apple', [change('agreement', 'have'), change('article', 'an')])
+    const tokens = fixedTokens('I has a apple', [e], [])
+    expect(styleOf(tokens, 'have')).toEqual(WARN)
+    expect(styleOf(tokens, 'an')).toEqual(SMALL)
+    expect(styleOf(tokens, 'apple')).toEqual({})
+  })
+
+  test('no match: all raw changes in one group colors the word', async () => {
+    const e = err('I has go', 'I have gone', [change('agreement', 'zzz'), change('verb-form')])
+    expect(fixedTokens('I has go', [e], []).filter((t) => t.text === 'have' || t.text === 'gone').map((t) => t.style)).toEqual([WARN, WARN])
+  })
+
+  test('no match: mixed groups are neutral', async () => {
+    const e = err('I has a apple', 'I have an apple', [change('agreement'), change('article')])
+    const tokens = fixedTokens('I has a apple', [e], [])
+    expect(styleOf(tokens, 'have')).toEqual(NEUTRAL)
+    expect(styleOf(tokens, 'an')).toEqual(NEUTRAL)
+  })
+
+  test('no match: a group with an `other` change is neutral', async () => {
+    const e = err('I has it', 'I have it', [change('agreement'), change('other')])
+    expect(styleOf(fixedTokens('I has it', [e], []), 'have')).toEqual(NEUTRAL)
+  })
+
+  test('a change of a muted kind is drawn plain', async () => {
+    const e = err('I has a apple', 'I have an apple', [change('agreement', 'have'), change('article', 'an')])
+    const tokens = fixedTokens('I has a apple', [e], ['article'])
+    expect(styleOf(tokens, 'an')).toEqual({})
+    expect(styleOf(tokens, 'have')).toEqual(WARN)
+  })
+
+  test('no match with a muted raw change in the error: neutral, not the shared group', async () => {
+    const e = err('I has a apple', 'I have an apple', [change('agreement'), change('article')])
+    const tokens = fixedTokens('I has a apple', [e], ['article'])
+    expect(styleOf(tokens, 'have')).toEqual(NEUTRAL)
+  })
+
+  test('a matched `other` change is neutral', async () => {
+    const e = err('I has a apple', 'I have an apple', [change('agreement', 'have'), change('other', 'an')])
+    const tokens = fixedTokens('I has a apple', [e], [])
+    expect(styleOf(tokens, 'an')).toEqual(NEUTRAL)
+    expect(styleOf(tokens, 'have')).toEqual(WARN)
+  })
+
+  test('an error with no visible change left is neutral', async () => {
+    const gone = err('I dont know', "I don't know now", [change('spelling', undefined, 'dont is a contraction')])
+    const out = fixedTokens('I dont know', [gone], ['apostrophe'])
+    expect(join(out)).toBe('I dont know now')
+    expect(styleOf(out, 'now')).toEqual(NEUTRAL)
+  })
+
+  test('a muted error is not spliced', async () => {
+    const e = err('I has it', 'I have it', [change('agreement', 'have')])
+    expect(join(fixedTokens('I has it', [e], ['agreement']))).toBe('I has it')
+  })
+
+  test('a pure removal changes the text and marks nothing', async () => {
+    const tokens = fixedTokens('I really has it', [err('really has', 'has', [change('word-choice')])], [])
+    expect(join(tokens)).toBe('I has it')
+    expect(tokens.every((t) => Object.keys(t.style).length === 0)).toBe(true)
+  })
+
+  const numbered = (n: number, from = 0) => Array.from({ length: n }, (_, i) => `w${from + i}`)
+
+  test('a short text is not cut', async () => {
+    const text = 'w0 w1 w2 has x w3 w4 w5'
+    const tokens = fixedTokens(text, [err('w2 has x', 'w2 have x', [change('agreement', 'have')])], [])
+    expect(join(tokens)).toBe('w0 w1 w2 have x w3 w4 w5')
+    expect(tokens.some((t) => t.text === '…')).toBe(false)
+  })
+
+  test('a long middle gap becomes one dim …', async () => {
+    const text = `a b c d e. ${numbered(30).join(' ')} f g h i j. k l m n o p`
+    const tokens = fixedTokens(
+      text,
+      [err('a b c d e.', 'a b c d E.', [change('capitalization', 'E.')]), err('f g h i j.', 'f g h i J.', [change('capitalization', 'J.')])],
+      [],
+    )
+    expect(join(tokens)).toBe('a b c d E. w0 w1 w2 w3 … f g h i J. k l m n …')
+    expect(tokens.find((t) => t.text === '…')).toEqual({ text: '…', space: true, style: DIMMED })
+  })
+
+  test('a long start and end are cut with a leading and a trailing …', async () => {
+    const text = `${numbered(20).join(' ')} the dogs run ${numbered(20, 40).join(' ')}`
+    const tokens = fixedTokens(text, [err('the dogs run', 'the dog runs', [change('number', 'dog'), change('agreement', 'runs')])], [])
+    expect(join(tokens)).toBe('… w17 w18 w19 the dog runs w40 w41 w42 w43 …')
+    expect(tokens[0]).toEqual({ text: '…', space: false, style: DIMMED })
+    expect(tokens[tokens.length - 1].style).toEqual(DIMMED)
+  })
+
+  test('with no changed token, the first 8 tokens and …', async () => {
+    const text = numbered(20).join(' ')
+    expect(join(fixedTokens(text, [], []))).toBe(`${numbered(8).join(' ')} …`)
+  })
+
+  test('a removal-only fix is shown in context: 4 tokens each side, no mark', async () => {
+    const text = `${numbered(20).join(' ')} really ${numbered(20, 40).join(' ')}`
+    const tokens = fixedTokens(text, [err('w19 really', 'w19', [change('word-choice')])], [])
+    expect(join(tokens)).toBe('… w16 w17 w18 w19 w40 w41 w42 w43 …')
+    expect(tokens.filter((t) => t.text !== '…').every((t) => Object.keys(t.style).length === 0)).toBe(true)
+  })
+
+  test('a removal at the very start or end keeps its context too', async () => {
+    const head = fixedTokens(`really ${numbered(20).join(' ')}`, [err('really w0', 'w0', [change('word-choice')])], [])
+    expect(join(head)).toBe('w0 w1 w2 w3 …')
+    const tail = fixedTokens(`${numbered(20).join(' ')} really`, [err('w19 really', 'w19', [change('word-choice')])], [])
+    expect(join(tail)).toBe('… w16 w17 w18 w19')
+  })
+
+  test('a removal inside a rewrite counts at its place', async () => {
+    const text = `${numbered(20).join(' ')} a very big dog ${numbered(20, 40).join(' ')}`
+    const tokens = fixedTokens(text, [err('a very big dog', 'a big dog', [change('word-choice')])], [])
+    expect(join(tokens)).toBe('… w17 w18 w19 a big dog w40 w41 …')
+  })
+
+  test('a text of up to 9 tokens with no change is not cut (a … would hide one token)', async () => {
+    expect(join(fixedTokens(numbered(8).join(' '), [], []))).toBe(numbered(8).join(' '))
+    expect(join(fixedTokens(numbered(9).join(' '), [], []))).toBe(numbered(9).join(' '))
+    expect(join(fixedTokens(numbered(10).join(' '), [], []))).toBe(`${numbered(8).join(' ')} …`)
+  })
+
+  test('a gap of one token is shown; a gap of two is cut', async () => {
+    const mid = (n: number) => `A ${numbered(n).join(' ')} B`
+    const two = (n: number) => fixedTokens(mid(n), [err('A', 'a', [change('capitalization', 'a')]), err('B', 'b', [change('capitalization', 'b')])], [])
+    expect(join(two(9))).toBe('a w0 w1 w2 w3 w4 w5 w6 w7 w8 b')
+    expect(join(two(10))).toBe('a w0 w1 w2 w3 … w6 w7 w8 w9 b')
+    expect(join(two(11))).toBe('a w0 w1 w2 w3 … w7 w8 w9 w10 b')
+  })
+
+  test('a leading or trailing stretch of one token is shown', async () => {
+    const e = err('x', 'X', [change('capitalization', 'X')])
+    expect(join(fixedTokens(`${numbered(5).join(' ')} x`, [e], []))).toBe('w0 w1 w2 w3 w4 X')
+    expect(join(fixedTokens(`${numbered(6).join(' ')} x`, [e], []))).toBe('… w2 w3 w4 w5 X')
+    expect(join(fixedTokens(`x ${numbered(5).join(' ')}`, [e], []))).toBe('X w0 w1 w2 w3 w4')
+    expect(join(fixedTokens(`x ${numbered(6).join(' ')}`, [e], []))).toBe('X w0 w1 w2 w3 …')
+  })
+})
+
+describe('wrapTokens', () => {
+  const tok = (text: string, space = true) => ({ text, space, style: {} })
+  const words = (s: string) => s.split(' ').map((w, i) => tok(w, i > 0))
+  const show = (lines: { text: string; space: boolean }[][]) => lines.map((l) => l.map((t, i) => (t.space && i > 0 ? ' ' : '') + t.text).join(''))
+
+  test('greedy lines within the width', async () => {
+    const lines = wrapTokens(words('aaaa bbbb cccc dddd eeee ffff'), 20, 2)
+    expect(show(lines)).toEqual(['aaaa bbbb cccc dddd', 'eeee ffff'])
+  })
+
+  test('the first line holds the prefix tokens; later lines count the indent', async () => {
+    const tokens = [tok('✎ ', false), tok('English · ', false), tok('one', false), ...words('two three four five six seven').map((t) => ({ ...t, space: true }))]
+    const lines = wrapTokens(tokens, 28, 2)
+    expect(show(lines)).toEqual(['✎ English · one two three', 'four five six seven'])
+    expect(lines[1][0].space).toBe(false)
+  })
+
+  test('a continuation line is cut at columns minus the indent', async () => {
+    const tokens = words('aaaaaaaaa bbbbbbbbb cccccccc dddddddd')
+    expect(show(wrapTokens(tokens, 20, 2))).toEqual(['aaaaaaaaa bbbbbbbbb', 'cccccccc dddddddd'])
+    expect(show(wrapTokens(tokens, 20, 4))).toEqual(['aaaaaaaaa bbbbbbbbb', 'cccccccc', 'dddddddd'])
+  })
+
+  test('columns under 20 are read as 20', async () => {
+    const tokens = words('aaaa bbbb cccc dddd eeee')
+    expect(wrapTokens(tokens, 5, 2)).toEqual(wrapTokens(tokens, 20, 2))
+    expect(show(wrapTokens(tokens, 5, 2))).toEqual(['aaaa bbbb cccc dddd', 'eeee'])
+  })
+
+  test('a token with no space before it stays with the one before it', async () => {
+    const lines = wrapTokens([tok('aaaaaaaaaa', false), tok('bbbbbbbbb'), tok(',', false), tok('cc')], 20, 2)
+    expect(show(lines)).toEqual(['aaaaaaaaaa', 'bbbbbbbbb, cc'])
+  })
+
+  test('a token marked breakBefore may start a line though no space precedes it', async () => {
+    const tokens = [tok('✎ ', false), tok('English · ', false), { ...tok('Internationalisation', false), breakBefore: true }, tok('is'), tok('hard')]
+    expect(show(wrapTokens(tokens, 30, 2))).toEqual(['✎ English · ', 'Internationalisation is hard'])
+    expect(show(wrapTokens(tokens, 38, 2))).toEqual(['✎ English · Internationalisation is', 'hard'])
+  })
+
+  test('a token wider than a line gets a line to itself', async () => {
+    const lines = wrapTokens([tok('aa', false), tok('x'.repeat(30)), tok('bb')], 20, 2)
+    expect(show(lines)).toEqual(['aa', 'x'.repeat(30), 'bb'])
+  })
+
+  test('no tokens, no lines', async () => {
+    expect(wrapTokens([], 40, 2)).toEqual([])
+  })
+})
+
+describe('groupReasons', () => {
+  const e = (...changes: [string, string][]) => ({ original: 'a b', corrected: 'a c', changes: changes.map(([kind, why]) => ({ kind, why })) })
+
+  test('one entry per group present, in GROUPS order, other last', async () => {
+    const out = groupReasons([e(['other', 'odd'], ['comma', 'pause']), e(['article', 'the'], ['verb-form', 'past'])])
+    expect(out).toEqual([
+      { group: GROUPS[0], whys: ['past'] },
+      { group: GROUPS[1], whys: ['the'] },
+      { group: GROUPS[4], whys: ['pause'] },
+      { group: null, whys: ['odd'] },
+    ])
+  })
+
+  test('reasons keep their order within a group; a repeat is listed once', async () => {
+    const out = groupReasons([e(['agreement', 'one'], ['number', 'two']), e(['pronoun', 'one'], ['verb-form', 'three'])])
+    expect(out).toEqual([{ group: GROUPS[0], whys: ['one', 'two', 'three'] }])
+  })
+
+  test('an unknown kind counts as other; no errors, no entries', async () => {
+    expect(groupReasons([e(['nope', 'x'])])).toEqual([{ group: null, whys: ['x'] }])
+    expect(groupReasons([])).toEqual([])
   })
 })

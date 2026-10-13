@@ -8,7 +8,7 @@ const CHANGE = { kind: 'verb-form', why: 'verb form' }
 const errorOf = (original: string, corrected: string, changes = [CHANGE]) => ({ original, corrected, changes })
 const fixReply = (original = ORIGINAL_A, corrected = 'I want you to check my text.') =>
   JSON.stringify({ errors: [errorOf(original, corrected)] })
-const FIX_A = { errors: [errorOf(ORIGINAL_A, 'I want you to check my text.')] }
+const FIX_A = { text: ORIGINAL_A, errors: [errorOf(ORIGINAL_A, 'I want you to check my text.')] }
 
 const flush = async () => {
   for (let i = 0; i < 20; i++) await Promise.resolve()
@@ -124,6 +124,16 @@ describe('debounce and change detection', () => {
     const result = s.timers[0].fn()
     expect(typeof result.then).toBe('function')
     await result
+  })
+
+  test('a draft view carries the whitespace-normalized text the errors were checked against', async () => {
+    const s = setup()
+    const draft = A.replace(' ', '\n  ')
+    const { p } = await s.startDraftCall(draft)
+    s.answer(0, fixReply())
+    await p
+    expect(s.last()).toEqual({ kind: 'fix', source: 'draft', ...FIX_A })
+    expect(s.last().text).toBe(A)
   })
 
   test('an unchanged draft after a check reuses the cache', async () => {
@@ -264,7 +274,17 @@ describe('view clear rules', () => {
   test('a draft fix is kept while its original is still in the draft', async () => {
     const s = await withFix()
     await s.checker.poke(`  ${A.replace(' ', '\n')} Thanks a lot`) // whitespace differs, original still there
-    expect(s.views).toHaveLength(1)
+    expect(s.views).toHaveLength(2)
+    expect(s.last()).toEqual({ kind: 'fix', source: 'draft', text: `${A} Thanks a lot`, errors: FIX_A.errors })
+  })
+
+  test('an edit that keeps every error writes a view with the new text', async () => {
+    const s = await withFix()
+    await s.checker.poke(`Hello. ${A}`)
+    expect(s.views).toHaveLength(2)
+    expect(s.last()).toEqual({ kind: 'fix', source: 'draft', text: `Hello. ${A}`, errors: FIX_A.errors })
+    await s.checker.poke(`Hello there. ${A} Thanks`)
+    expect(s.last()).toEqual({ kind: 'fix', source: 'draft', text: `Hello there. ${A} Thanks`, errors: FIX_A.errors })
   })
 
   test('a draft fix is cleared when its original is no longer in the draft', async () => {
@@ -305,10 +325,17 @@ describe('view clear rules', () => {
     await p
     expect(s.views).toHaveLength(1)
     await s.checker.poke(`${draft} Thanks`) // both originals are still there
-    expect(s.views).toHaveLength(1)
-    await s.checker.poke(`I want that you check my text. ${B} Thanks`) // the first original is gone
     expect(s.views).toHaveLength(2)
-    expect(s.last()).toEqual({ kind: 'fix', source: 'draft', errors: [errorOf(B, 'She goes to school every day.')] })
+    expect(s.last().errors).toHaveLength(2)
+    expect(s.last().text).toBe(`${draft} Thanks`)
+    await s.checker.poke(`I want that you check my text. ${B} Thanks`) // the first original is gone
+    expect(s.views).toHaveLength(3)
+    expect(s.last()).toEqual({
+      kind: 'fix',
+      source: 'draft',
+      text: `I want that you check my text. ${B} Thanks`,
+      errors: [errorOf(B, 'She goes to school every day.')],
+    })
     await s.checker.poke('Something else entirely here') // none left
     expect(s.last()).toBeNull()
   })
@@ -368,6 +395,17 @@ describe('sent mode (the draft reads empty when the answer lands)', () => {
     expect(s.last()).toEqual({ kind: 'fix', source: 'sent', ...FIX_A })
   })
 
+  test('a sent view from a kept in-flight call carries the pre-submit draft text, not the submitted text', async () => {
+    const s = setup()
+    const { p } = await s.startDraftCall(A)
+    const submitted = s.checker.submit(`${A} [pasted text expanded]`)
+    s.readText = ''
+    s.answer(0, fixReply())
+    await p
+    await submitted
+    expect(s.last()).toEqual({ kind: 'fix', source: 'sent', ...FIX_A })
+  })
+
   test('submit matches the in-flight call by the submitted text as well as the last-seen draft', async () => {
     const s = setup()
     const { p: p } = await s.startDraftCall(A)
@@ -415,6 +453,17 @@ describe('sent mode (the draft reads empty when the answer lands)', () => {
     await p
     s.readText = ''
     await s.checker.submit(A)
+    expect(s.calls).toHaveLength(1)
+    expect(s.last()).toEqual({ kind: 'fix', source: 'sent', ...FIX_A })
+  })
+
+  test('a sent cache hit on the pre-submit draft carries the pre-submit draft text', async () => {
+    const s = setup()
+    const { p } = await s.startDraftCall(A)
+    s.answer(0, fixReply())
+    await p
+    s.readText = ''
+    await s.checker.submit(`${A} [pasted text expanded]`)
     expect(s.calls).toHaveLength(1)
     expect(s.last()).toEqual({ kind: 'fix', source: 'sent', ...FIX_A })
   })
@@ -557,13 +606,13 @@ describe('submit clears the view for a new prompt', () => {
     s.answer(0, fixReply())
     await q
     await s.checker.poke('') // the box reads empty; the sent view stays
-    expect(s.last()).toMatchObject({ source: 'sent', errors: [{ original: ORIGINAL_A }] })
+    expect(s.last()).toMatchObject({ source: 'sent', text: A, errors: [{ original: ORIGINAL_A }] })
     const r = s.checker.submit(B)
     expect(s.last()).toBeNull()
     expect(s.calls).toHaveLength(2)
     s.answer(1, fixReply(B, 'She goes to school every day.'))
     await r
-    expect(s.last()).toMatchObject({ kind: 'fix', source: 'sent', errors: [{ original: B }] })
+    expect(s.last()).toMatchObject({ kind: 'fix', source: 'sent', text: B, errors: [{ original: B }] })
   })
 })
 

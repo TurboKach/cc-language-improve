@@ -26,7 +26,7 @@ export const createChecker = ({ read, after, complete, setView }) => {
   let requestId = 0 // bumped on every change and submit; guards timer callbacks
   let timer = null
   let active = null // the one live model call: { draft, sentText, mode, muted, key, controller, done }
-  let cache = null // one entry: { key, result }; key is the draft plus the muted list
+  let cache = null // one entry: { key, result, text }; key is the draft plus the muted list; text is what the errors were checked against
   let muted = [] // muted kind slugs, sorted
   let view = null // the view last written through setView
   let stopped = false // set by stop(): no effect leaves this checker afterwards
@@ -51,9 +51,9 @@ export const createChecker = ({ read, after, complete, setView }) => {
 
   const cacheKey = (draft, slugs) => `${draft}\n${slugs.join(',')}`
 
-  const apply = (result, source) => {
+  const apply = (result, source, text) => {
     if (result === 'ok') show({ kind: 'ok', source })
-    else if (result !== 'skip' && result !== null) show({ kind: 'fix', source, ...result })
+    else if (result !== 'skip' && result !== null) show({ kind: 'fix', source, text, ...result })
   }
 
   const run = async (call) => {
@@ -82,8 +82,9 @@ export const createChecker = ({ read, after, complete, setView }) => {
         : current === call.draft
     active = null
     if (!fresh) return
-    if (result !== null) cache = { key: call.key, result }
-    apply(result, call.mode)
+    const text = normalizeWhitespace(call.sentText)
+    if (result !== null) cache = { key: call.key, result, text }
+    apply(result, call.mode, text)
   }
 
   const check = (draft, mode) => {
@@ -92,7 +93,7 @@ export const createChecker = ({ read, after, complete, setView }) => {
     if (sentText === null) return Promise.resolve()
     const key = cacheKey(draft, muted)
     if (cache !== null && cache.key === key) {
-      apply(cache.result, mode)
+      apply(cache.result, mode, cache.text)
       return Promise.resolve()
     }
     abortActive()
@@ -139,7 +140,7 @@ export const createChecker = ({ read, after, complete, setView }) => {
           ? view.errors.filter((error) => containsWordRun(normalizeWhitespace(sentNow), error.original))
           : []
       if (kept.length === 0) clearView()
-      else if (kept.length < view.errors.length) show({ ...view, errors: kept })
+      else show({ ...view, text: normalizeWhitespace(sentNow), errors: kept })
     }
     startTimer()
   }
@@ -174,7 +175,7 @@ export const createChecker = ({ read, after, complete, setView }) => {
 
       const hit = [text, pre].map((draft) => (cache !== null && cache.key === cacheKey(draft, muted) ? cache : null)).find(Boolean)
       if (hit) {
-        apply(hit.result, 'sent')
+        apply(hit.result, 'sent', hit.text)
         return kept ? kept.done : Promise.resolve()
       }
       return kept ? kept.done : check(text, 'sent')

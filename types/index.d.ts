@@ -3,15 +3,16 @@ export type View =
   | {
       kind: 'fix'
       source: 'draft' | 'sent'
+      text: string
       errors: {
         original: string
         corrected: string
-        changes: { kind: string; why: string }[]
+        changes: { kind: string; why: string; words?: string }[]
       }[]
     }
 
 declare module 'claude-code' {
   interface PluginState {
-    'language-improve': { view: View | null; muted: string[]; page: number }
+    'language-improve': { view: View | null; muted: string[]; expanded: boolean }
   }
 }

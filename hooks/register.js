@@ -34,16 +34,13 @@ export const register = (on) => {
       immediate: true,
     })
     await $.state.set({ plugin: 'language-improve', key: 'muted' }, stored)
+    await $.state.set({ plugin: 'language-improve', key: 'expanded' }, (await $.store.get('expanded')) === true)
 
     const mine = createChecker({
       read: () => $.prompt.read(),
       after: (ms, fn) => $.clock.after(ms, fn),
       complete: (request, options) => $.model.complete(request, options),
-      // A new view starts on page 1.
-      setView: async (view) => {
-        await $.state.set({ plugin: 'language-improve', key: 'page' }, 0)
-        await $.state.set({ plugin: 'language-improve', key: 'view' }, view)
-      },
+      setView: (view) => $.state.set({ plugin: 'language-improve', key: 'view' }, view),
     })
     mine.setMuted(stored)
     checker = mine
@@ -67,18 +64,12 @@ export const register = (on) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const { value: view } = await $.state.get({ plugin: 'language-improve', key: 'view' })
     const { value: muted = [] } = await $.state.get({ plugin: 'language-improve', key: 'muted' })
-    const { value: page = 0 } = await $.state.get({ plugin: 'language-improve', key: 'page' })
+    const { value: expanded = false } = await $.state.get({ plugin: 'language-improve', key: 'expanded' })
     if (!view || e.props.hasSurvey) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
-    const layout = bandRows(view, { maxRows: e.props.maxRows, bodyColumns: e.props.bodyColumns, muted, page })
+    const layout = bandRows(view, { maxRows: e.props.maxRows, bodyColumns: e.props.bodyColumns, muted, expanded })
     if (layout.rows.length === 0) return next(e) // no room for our rows
 
-    // The page moves from the page shown, wrapping; read again at the press.
-    const turnPage = async (step) => {
-      const { value: now = 0 } = await $.state.get({ plugin: 'language-improve', key: 'page' })
-      const shown = Math.min(Math.max(now, 0), layout.pages - 1)
-      await $.state.set({ plugin: 'language-improve', key: 'page' }, (shown + step + layout.pages) % layout.pages)
-    }
     // Adds the kind to the stored list, so a mute from another session survives.
     const mute = async (slug) => {
       const merged = withKind(await $.store.get('muted'), slug, true)
@@ -87,10 +78,11 @@ export const register = (on) => {
       if (checker !== null) checker.setMuted(merged)
       $.ui.toast(`Muted ${KINDS.find((k) => k.slug === slug).label} · /language-improve to unmute`)
     }
-    const press = (key) => {
-      if (key === 'page:next') return () => turnPage(1)
-      if (key === 'page:back') return () => turnPage(-1)
-      return () => mute(key.slice('mute:'.length))
+
+    // Shows or hides the reasons and the mute buttons; the choice outlives the draft and the session.
+    const setExpanded = async (value) => {
+      await $.store.set('expanded', value)
+      await $.state.set({ plugin: 'language-improve', key: 'expanded' }, value)
     }
 
     const rows = layout.rows.map((row) => {
@@ -102,9 +94,14 @@ export const register = (on) => {
       }
       const gap = () => Text({ children: '  ' })
       const items = [
-        ...(row.pageText ? [Text({ dimColor: true, children: row.pageText })] : []),
         ...row.actions.map((action) =>
-          Button({ key: action.key, hotkey: action.hotkey, label: action.label, plain: true, onPress: press(action.key) }),
+          Button({
+            key: action.key,
+            hotkey: action.hotkey,
+            plain: true,
+            onPress: () => (action.key === 'toggle' ? setExpanded(!expanded) : mute(action.key.slice('mute:'.length))),
+            children: Text({ color: action.color, children: action.label }),
+          }),
         ),
         ...(row.hint ? [Text({ dimColor: true, children: row.hint })] : []),
       ]
@@ -136,7 +133,7 @@ export const register = (on) => {
     if (muted.length === 0) {
       return Box({
         flexDirection: 'column',
-        children: [heading, Text({ children: 'Nothing is muted. Focus the band (ctrl+x tab) and press a mute key.' })],
+        children: [heading, Text({ children: 'Nothing is muted. Focus the band (ctrl+x tab), press m, then a mute key.' })],
       })
     }
     // Removes the kind from the stored list, so a mute from another session survives.

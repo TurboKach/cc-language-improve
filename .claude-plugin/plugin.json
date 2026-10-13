@@ -1,7 +1,7 @@
 {
   "name": "language-improve",
-  "version": "0.2.0",
-  "description": "Checks your prompt draft's English with Haiku after a pause and lists up to 8 errors with their corrections in the band above the prompt. Mute the kinds of error you do not want to see.",
+  "version": "0.3.0",
+  "description": "Checks your prompt draft's English with Haiku after a pause and shows the whole draft corrected in the band above the prompt, with the changed words colored by kind of error and a short reason for each. Mute the kinds of error you do not want to see.",
   "author": {
     "name": "TurboKach"
   },
